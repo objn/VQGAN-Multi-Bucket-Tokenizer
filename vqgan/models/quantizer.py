@@ -65,8 +65,10 @@ class VectorQuantizer(nn.Module):
         if self.use_ema:
             codebook_loss = torch.zeros((), device=z.device, dtype=z.dtype)
         else:
-            codebook_loss = F.mse_loss(z_q.detach(), z)
-        commitment_loss = F.mse_loss(z_q, z.detach())
+            # codebook_loss pulls the codebook (z_q) toward the encoder output (sg[z])
+            codebook_loss = F.mse_loss(z_q, z.detach())
+        # commitment_loss pulls the encoder output (z) toward the codebook (sg[z_q])
+        commitment_loss = F.mse_loss(z, z_q.detach())
         loss = codebook_loss + self.commitment_beta * commitment_loss
 
         # straight-through estimator
