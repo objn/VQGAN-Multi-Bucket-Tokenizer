@@ -53,6 +53,21 @@ This project uses [`uv`](https://docs.astral.sh/uv/) for environment/package man
 uv sync
 ```
 
+### Quick-start scripts
+
+- **`train.sh`** / **`train_with_coco_mini.sh`** — plain `python`, no uv/.venv. For
+  environments that already ship torch/torchvision at the system level, e.g. RunPod's
+  PyTorch cluster templates (install the remaining deps first:
+  `pip install lpips scipy tensorboard tqdm pillow`).
+- **`train_uv.sh`** / **`train_with_coco_mini_uv.sh`** — uv-managed equivalents (runs
+  `uv sync` implicitly via `uv run`), for local dev machines without a pre-installed
+  torch.
+
+The `_with_coco_mini` variants download+extract COCO train2017/val2017 into
+`data/train`/`data/val` (skipped if already populated) before training; the plain
+variants assume the data is already there. All four forward extra args straight to
+`vqgan.train`, e.g. `./train_uv.sh --resume-from runs/vqgan-multi/checkpoints/latest.pt`.
+
 ## Data
 
 Point `--train-dir` / `--val-dir` at a folder of images (any nesting, no captions or

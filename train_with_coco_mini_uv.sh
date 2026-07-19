@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Downloads COCO train2017/val2017 into data/train and data/val (skipped if already
-# present), then starts training via train.sh (plain python, no uv). See
-# train_with_coco_mini_uv.sh for the uv-managed equivalent. Any extra args are
-# forwarded to train.sh.
+# present), then starts training via train_uv.sh (uv-managed). See
+# train_with_coco_mini.sh for the plain-python equivalent. Any extra args are
+# forwarded to train_uv.sh.
 #
 # Usage:
-#   ./train_with_coco_mini.sh
-#   ./train_with_coco_mini.sh --batch-size 2 --grad-accum-steps 8
+#   ./train_with_coco_mini_uv.sh
+#   ./train_with_coco_mini_uv.sh --batch-size 2 --grad-accum-steps 8
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -41,4 +41,4 @@ fetch_and_extract "$TRAIN_URL" "$TRAIN_DIR" "train2017.zip"
 fetch_and_extract "$VAL_URL" "$VAL_DIR" "val2017.zip"
 
 echo "==> Starting training..."
-./train.sh "$@"
+./train_uv.sh "$@"
