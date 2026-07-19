@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Downloads COCO train2017/val2017 and extracts them to LOCAL disk (default:
-# $HOME/vqgan_data), then starts training via train_uv.sh (uv-managed) with
+# $HOME/coco_data), then starts training via train_uv.sh (uv-managed) with
 # --train-dir/--val-dir pointed at that local dataset. See train_with_coco_mini.sh
 # for the plain-python equivalent.
 #
@@ -23,7 +23,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 TRAIN_URL="http://images.cocodataset.org/zips/train2017.zip"
 VAL_URL="http://images.cocodataset.org/zips/val2017.zip"
 
-DATA_DIR="${VQGAN_DATA_DIR:-$HOME/vqgan_data}"
+DATA_DIR="${VQGAN_DATA_DIR:-$HOME/coco_data}"
 TRAIN_DIR="$DATA_DIR/train"
 VAL_DIR="$DATA_DIR/val"
 
