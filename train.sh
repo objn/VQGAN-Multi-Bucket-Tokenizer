@@ -10,8 +10,15 @@
 #   ./train.sh                              # uses configs/vqgan-multi.json defaults
 #   ./train.sh --resume-from runs/vqgan-multi/checkpoints/latest.pt
 #   ./train.sh --batch-size 2 --grad-accum-steps 8
+#   VQGAN_NUM_GPUS=2 ./train.sh             # DistributedDataParallel across 2 GPUs
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-python -m vqgan.train "$@"
+NUM_GPUS="${VQGAN_NUM_GPUS:-1}"
+
+if [ "$NUM_GPUS" -gt 1 ]; then
+    torchrun --standalone --nproc_per_node="$NUM_GPUS" -m vqgan.train "$@"
+else
+    python -m vqgan.train "$@"
+fi

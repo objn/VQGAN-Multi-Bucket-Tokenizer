@@ -70,6 +70,13 @@ class BucketedBatchSampler(Sampler):
     Deterministic given (seed, epoch, batch_offset), so training can resume mid-epoch:
     `batch_offset` skips that many already-consumed batches from the reproducible
     per-epoch batch order.
+
+    For multi-GPU (DistributedDataParallel) training, pass `rank`/`world_size`: every
+    rank builds the identical full batch order (same seed+epoch, deterministic) and
+    then takes a disjoint `[rank::world_size]` shard of it, truncated so every rank
+    gets exactly the same number of batches -- required because DDP's backward pass is
+    a collective operation and all ranks must call it the same number of times per
+    epoch.
     """
 
     def __init__(
@@ -80,6 +87,8 @@ class BucketedBatchSampler(Sampler):
         epoch: int = 0,
         batch_offset: int = 0,
         drop_last: bool = True,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         self.bucket_ids = bucket_ids
         self.batch_size = batch_size
@@ -87,6 +96,8 @@ class BucketedBatchSampler(Sampler):
         self.epoch = epoch
         self.batch_offset = batch_offset
         self.drop_last = drop_last
+        self.rank = rank
+        self.world_size = world_size
 
         self.indices_by_bucket: dict[int, list[int]] = defaultdict(list)
         for idx, bucket_id in enumerate(bucket_ids):
@@ -96,7 +107,8 @@ class BucketedBatchSampler(Sampler):
         self.epoch = epoch
         self.batch_offset = batch_offset
 
-    def _build_batches(self) -> list[list[int]]:
+    def _build_all_batches(self) -> list[list[int]]:
+        """The full, un-sharded batch order -- identical on every rank."""
         generator = torch.Generator().manual_seed(self.seed + self.epoch)
         batches: list[list[int]] = []
 
@@ -112,6 +124,13 @@ class BucketedBatchSampler(Sampler):
         # shuffle batch order so buckets interleave through an epoch, not one after another
         batch_perm = torch.randperm(len(batches), generator=generator).tolist()
         return [batches[i] for i in batch_perm]
+
+    def _build_batches(self) -> list[list[int]]:
+        all_batches = self._build_all_batches()
+        if self.world_size == 1:
+            return all_batches
+        per_rank_count = len(all_batches) // self.world_size  # equal count on every rank
+        return all_batches[self.rank :: self.world_size][:per_rank_count]
 
     def __iter__(self):
         batches = self._build_batches()

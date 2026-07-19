@@ -162,6 +162,31 @@ Key defaults (from `configs/vqgan-multi.json`), all overridable via CLI flags (s
 uv run python -m vqgan.train --resume-from runs/vqgan-multi/checkpoints/latest.pt ...
 ```
 
+### Multi-GPU (DistributedDataParallel)
+
+Set `VQGAN_NUM_GPUS` when using `train.sh`/`train_uv.sh` (or `train_with_coco_mini*.sh`,
+which forward it through) to train across multiple GPUs on one machine via
+`torchrun`, one process per GPU:
+
+```bash
+VQGAN_NUM_GPUS=2 ./train_uv.sh --train-dir data/train --val-dir data/val
+```
+
+Each GPU gets a disjoint shard of the same deterministic per-epoch batch order (every
+rank computes the identical shuffle from the same seed, then takes a `[rank::world_size]`
+slice — see `BucketedBatchSampler` in `vqgan/data/buckets.py`), so there's no data
+overlap or duplication across GPUs. `--batch-size` is **per GPU**, not total — effective
+batch size becomes `batch_size × grad_accum_steps × world_size`, printed at the start of
+every run. Only rank 0 writes TensorBoard logs, prints progress, and saves checkpoints;
+checkpoints are saved with clean (non-DDP-prefixed) keys, so they load identically
+whether you resume on 1 GPU or N GPUs. `--num-workers` is still per-process, so with
+`VQGAN_NUM_GPUS=2` you get `2 × num_workers` total DataLoader worker processes — lower
+`--num-workers` if that oversubscribes the pod's CPU count.
+
+This does **not** by itself fix an out-of-memory error — each GPU still needs to fit its
+own `--batch-size` independently. If you're hitting OOM, lower `--batch-size` (raise
+`--grad-accum-steps` to compensate) first, then add `VQGAN_NUM_GPUS` for throughput.
+
 ### Monitoring
 
 All metrics (reconstruction/codebook/perceptual/adversarial/discriminator loss,

@@ -81,7 +81,7 @@
   "train": {
     "output_dir": "runs/vqgan-multi",
     "total_steps": 300000,
-    "batch_size": 1,
+    "batch_size": 4,
     "grad_accum_steps": 5,
     "lr_generator": 4.5e-06,
     "lr_discriminator": 4.5e-06,
