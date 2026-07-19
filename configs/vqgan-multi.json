@@ -1,0 +1,100 @@
+{
+  "model": {
+    "in_channels": 3,
+    "base_channels": 128,
+    "channel_mults": [
+      1,
+      1,
+      2,
+      2,
+      4
+    ],
+    "latent_channels": 256,
+    "num_res_blocks": 2,
+    "codebook_size": 16384,
+    "codebook_dim": 256,
+    "commitment_beta": 0.25,
+    "use_ema": false,
+    "ema_decay": 0.99,
+    "discriminator_channels": 64,
+    "discriminator_num_layers": 3
+  },
+  "loss": {
+    "lambda_perceptual": 1.0,
+    "lambda_adv": 0.1,
+    "adv_loss_type": "hinge",
+    "discriminator_start_step": 30000
+  },
+  "data": {
+    "train_dir": "data/train",
+    "val_dir": "data/val",
+    "buckets": [
+      {
+        "name": "1:1",
+        "width": 1024,
+        "height": 1024
+      },
+      {
+        "name": "4:5",
+        "width": 832,
+        "height": 1024
+      },
+      {
+        "name": "5:4",
+        "width": 1024,
+        "height": 832
+      },
+      {
+        "name": "4:3",
+        "width": 1024,
+        "height": 768
+      },
+      {
+        "name": "3:4",
+        "width": 768,
+        "height": 1024
+      },
+      {
+        "name": "3:2",
+        "width": 1024,
+        "height": 672
+      },
+      {
+        "name": "2:3",
+        "width": 672,
+        "height": 1024
+      },
+      {
+        "name": "16:9",
+        "width": 1024,
+        "height": 576
+      },
+      {
+        "name": "9:16",
+        "width": 576,
+        "height": 1024
+      }
+    ],
+    "horizontal_flip": true,
+    "num_workers": 8
+  },
+  "train": {
+    "output_dir": "runs/vqgan-multi",
+    "total_steps": 300000,
+    "batch_size": 1,
+    "grad_accum_steps": 5,
+    "lr_generator": 4.5e-06,
+    "lr_discriminator": 4.5e-06,
+    "beta1": 0.5,
+    "beta2": 0.9,
+    "mixed_precision": true,
+    "grad_checkpointing": true,
+    "log_every": 50,
+    "image_log_every": 500,
+    "checkpoint_every": 2000,
+    "val_every": 2000,
+    "num_workers": 8,
+    "seed": 42,
+    "resume_from": ""
+  }
+}
