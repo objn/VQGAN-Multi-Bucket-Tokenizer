@@ -64,10 +64,22 @@ uv sync
   `uv sync` implicitly via `uv run`), for local dev machines without a pre-installed
   torch.
 
-The `_with_coco_mini` variants download+extract COCO train2017/val2017 into
-`data/train`/`data/val` (skipped if already populated) before training; the plain
-variants assume the data is already there. All four forward extra args straight to
-`vqgan.train`, e.g. `./train_uv.sh --resume-from runs/vqgan-multi/checkpoints/latest.pt`.
+The `_with_coco_mini` variants download+extract COCO train2017/val2017 (skipped if
+already populated), then pass `--train-dir`/`--val-dir` to the underlying train
+script pointing at wherever they extracted to. **They default to `$HOME/vqgan_data`,
+not the repo's `data/` dir** — on RunPod the repo typically lives on a Network Volume
+(commonly mounted at `/workspace`) for persistence, but writing 100k+ small `.jpg`
+files there is slow; `$HOME` is normally the pod's local Container Disk instead (fast,
+but wiped if the pod is terminated, not just stopped). Override with `VQGAN_DATA_DIR`
+if your setup differs, e.g. to keep the dataset on the network volume anyway (slower
+extraction, but survives pod termination):
+```bash
+VQGAN_DATA_DIR=data ./train_with_coco_mini.sh
+```
+The plain `train.sh`/`train_uv.sh` scripts assume the data is already extracted
+somewhere and take `--train-dir`/`--val-dir` directly. All four forward extra args
+straight to `vqgan.train`, e.g.
+`./train_uv.sh --resume-from runs/vqgan-multi/checkpoints/latest.pt`.
 
 ## Data
 
