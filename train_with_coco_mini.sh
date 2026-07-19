@@ -23,7 +23,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 TRAIN_URL="http://images.cocodataset.org/zips/train2017.zip"
 VAL_URL="http://images.cocodataset.org/zips/val2017.zip"
 
-DATA_DIR="${VQGAN_DATA_DIR:-$HOME/vqgan_data}"
+DATA_DIR="${VQGAN_DATA_DIR:-$HOME/coco_data}"
 TRAIN_DIR="$DATA_DIR/train"
 VAL_DIR="$DATA_DIR/val"
 
