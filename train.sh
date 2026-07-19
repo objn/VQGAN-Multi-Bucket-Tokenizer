@@ -3,8 +3,8 @@
 # have torch/torchvision installed at the system level (e.g. RunPod's PyTorch cluster
 # templates); see train_uv.sh for the uv-managed equivalent.
 # Assumes data/train and data/val already exist (see train_with_coco_mini.sh if you
-# need to fetch a dataset first) and the remaining deps are installed, e.g.:
-#   pip install lpips scipy tensorboard tqdm pillow
+# need to fetch a dataset first) and deps are installed, e.g.:
+#   pip install -r requirements.txt
 #
 # Usage:
 #   ./train.sh                              # uses configs/vqgan-multi.json defaults

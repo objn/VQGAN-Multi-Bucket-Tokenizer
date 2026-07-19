@@ -32,7 +32,9 @@ fetch_and_extract() {
     wget -c "$url" -O "$DATA_DIR/$zip_name"
 
     echo "==> Extracting $zip_name into $target_dir..."
-    unzip -q "$DATA_DIR/$zip_name" -d "$target_dir"
+    # -j (junk paths): COCO's zips nest everything under one top-level folder
+    # (e.g. train2017/*.jpg) -- without -j this becomes $target_dir/train2017/*.jpg
+    unzip -q -j "$DATA_DIR/$zip_name" -d "$target_dir"
 
     rm -f "$DATA_DIR/$zip_name"
 }

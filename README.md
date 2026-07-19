@@ -57,8 +57,9 @@ uv sync
 
 - **`train.sh`** / **`train_with_coco_mini.sh`** — plain `python`, no uv/.venv. For
   environments that already ship torch/torchvision at the system level, e.g. RunPod's
-  PyTorch cluster templates (install the remaining deps first:
-  `pip install lpips scipy tensorboard tqdm pillow`).
+  PyTorch cluster templates (install the remaining deps first: `pip install -r
+  requirements.txt` — safe even with torch preinstalled, pip skips already-satisfied
+  packages).
 - **`train_uv.sh`** / **`train_with_coco_mini_uv.sh`** — uv-managed equivalents (runs
   `uv sync` implicitly via `uv run`), for local dev machines without a pre-installed
   torch.

@@ -1,0 +1,12 @@
+# Mirrors [project.dependencies] in pyproject.toml, for plain `pip install -r
+# requirements.txt` on environments that already ship torch/torchvision (e.g. RunPod's
+# PyTorch cluster templates) -- pip skips packages whose installed version already
+# satisfies the constraint, so this is safe to run even when torch is preinstalled.
+torch>=2.2
+torchvision>=0.17
+lpips>=0.1.4
+scipy>=1.11
+numpy>=1.26
+pillow>=10.0
+tensorboard>=2.15
+tqdm>=4.66
