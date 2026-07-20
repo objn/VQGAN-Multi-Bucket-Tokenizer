@@ -41,17 +41,17 @@ class Bucket:
         return grid_h * grid_w
 
 
-# Reference bucket set from the spec (max side 1024px, 5 downsampling stages = 32x).
+# Bucket set with max side 768px -> max grid 24x24 (5 downsampling stages = 32x).
 DEFAULT_BUCKETS: tuple[Bucket, ...] = (
-    Bucket("1:1", 1024, 1024),
-    Bucket("4:5", 832, 1024),
-    Bucket("5:4", 1024, 832),
-    Bucket("4:3", 1024, 768),
-    Bucket("3:4", 768, 1024),
-    Bucket("3:2", 1024, 672),
-    Bucket("2:3", 672, 1024),
-    Bucket("16:9", 1024, 576),
-    Bucket("9:16", 576, 1024),
+    Bucket("1:1", 768, 768),
+    Bucket("4:5", 608, 768),
+    Bucket("5:4", 768, 608),
+    Bucket("4:3", 768, 576),
+    Bucket("3:4", 576, 768),
+    Bucket("3:2", 768, 512),
+    Bucket("2:3", 512, 768),
+    Bucket("16:9", 768, 448),
+    Bucket("9:16", 448, 768),
 )
 
 
@@ -60,6 +60,26 @@ def assign_bucket(image_width: int, image_height: int, buckets=DEFAULT_BUCKETS) 
     so portrait and landscape mismatches are penalized symmetrically), not by absolute size."""
     target_log_ratio = math.log(image_width / image_height)
     return min(buckets, key=lambda b: abs(math.log(b.aspect_ratio) - target_log_ratio))
+
+
+def steps_per_epoch(bucket_counts: dict[int, int], batch_size: int, accumulation_steps: int,
+                     world_size: int = 1) -> int:
+    """Number of weight updates one epoch yields, computed straight from dataset counts --
+    no shuffling/construction needed, so this is cheap to call just to size total_steps at
+    startup.
+
+    bucket_counts: {bucket_id: number of dataset images assigned to that bucket}.
+    Per .claude/mulit-vqgan.md, "Training Length -- Epoch-Based": batches are counted per
+    bucket (drop_last -- a bucket's remainder images that don't fill a full batch are
+    dropped, since a batch must be single-bucket) and summed, since batch_size/
+    accumulation_steps are global but bucket dataset sizes differ. The accumulation-cycle
+    division happens on that combined total, not per bucket, since accumulation windows
+    freely span bucket boundaries (batch_size/accumulation_steps are uniform across
+    buckets, so there's no correctness reason to keep them separate).
+    """
+    total_batches = sum(count // batch_size for count in bucket_counts.values())
+    per_rank_batches = total_batches // world_size if world_size > 1 else total_batches
+    return per_rank_batches // accumulation_steps
 
 
 class BucketedBatchSampler(Sampler):
@@ -73,10 +93,9 @@ class BucketedBatchSampler(Sampler):
 
     For multi-GPU (DistributedDataParallel) training, pass `rank`/`world_size`: every
     rank builds the identical full batch order (same seed+epoch, deterministic) and
-    then takes a disjoint `[rank::world_size]` shard of it, truncated so every rank
-    gets exactly the same number of batches -- required because DDP's backward pass is
-    a collective operation and all ranks must call it the same number of times per
-    epoch.
+    then takes a disjoint `[rank::world_size]` slice, truncated so every rank gets
+    exactly the same number of batches -- required because DDP's backward pass is a
+    collective operation and all ranks must call it the same number of times per epoch.
     """
 
     def __init__(

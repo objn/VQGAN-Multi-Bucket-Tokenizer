@@ -1,7 +1,7 @@
 [project]
 name = "vqgan32"
 version = "0.1.0"
-description = "VQGAN multi-resolution aspect-ratio-bucketed image tokenizer (max side 1024px)"
+description = "VQGAN multi-resolution aspect-ratio-bucketed image tokenizer (max side 768px)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,6 +13,11 @@ dependencies = [
     "pillow>=10.0",
     "tensorboard>=2.15",
     "tqdm>=4.66",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
 ]
 
 [build-system]

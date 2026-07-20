@@ -1,4 +1,4 @@
-# VQGAN Implementation Spec — Multi-Resolution Bucket Tokenizer (max side 1024)
+# VQGAN Implementation Spec — Multi-Resolution Bucket Tokenizer (max side 768)
 
 ## Context
 
@@ -10,7 +10,7 @@ Target hardware: single NVIDIA RTX 3080 Ti, 12GB VRAM, 64GB system RAM (DDR4). D
 
 ### Resolution / bucket system
 
-This VQGAN must handle **multiple aspect ratios**, not a single fixed square size. The constraint is: **longest side = 1024px**, with the other side determined by aspect ratio, both sides rounded to the nearest multiple of 32 (the downsampling factor).
+This VQGAN must handle **multiple aspect ratios**, not a single fixed square size. The constraint is: **longest side = 768px**, with the other side determined by aspect ratio, both sides rounded to the nearest multiple of 32 (the downsampling factor). (Reduced from an earlier 1024px max-side target — the larger version trained too slowly and was overkill for the current dataset scale; revisit 1024 later once the pipeline and dataset are scaled up.)
 
 Downsampling factor: **32×** (5 downsampling stages of ÷2 each: 2^5 = 32). This is fixed regardless of bucket.
 
@@ -18,15 +18,15 @@ Bucket table (compute more at runtime as needed, but these are the reference set
 
 | Ratio | Resolution (px) | Grid   | Tokens |
 |-------|------------------|--------|--------|
-| 1:1   | 1024×1024        | 32×32  | 1024   |
-| 4:5   | 832×1024         | 26×32  | 832    |
-| 5:4   | 1024×832         | 32×26  | 832    |
-| 4:3   | 1024×768         | 32×24  | 768    |
-| 3:4   | 768×1024         | 24×32  | 768    |
-| 3:2   | 1024×672         | 32×21  | 672    |
-| 2:3   | 672×1024         | 21×32  | 672    |
-| 16:9  | 1024×576         | 32×18  | 576    |
-| 9:16  | 576×1024         | 18×32  | 576    |
+| 1:1   | 768×768          | 24×24  | 576    |
+| 4:5   | 608×768          | 19×24  | 456    |
+| 5:4   | 768×608          | 24×19  | 456    |
+| 4:3   | 768×576          | 24×18  | 432    |
+| 3:4   | 576×768          | 18×24  | 432    |
+| 3:2   | 768×512          | 24×16  | 384    |
+| 2:3   | 512×768          | 16×24  | 384    |
+| 16:9  | 768×448          | 24×14  | 336    |
+| 9:16  | 448×768          | 14×24  | 336    |
 
 Because token count differs per bucket, **each training batch must contain images from a single bucket only** (see Data Pipeline below) — this is standard "aspect ratio bucketing" as used in SDXL and similar systems.
 
@@ -36,7 +36,7 @@ Because token count differs per bucket, **each training batch must contain image
 
 ### Encoder
 - CNN-based (ResNet-style residual blocks + downsampling convs), following the VQGAN (Esser et al. 2021) / Taming Transformers design
-- 5 downsampling stages, each halving spatial resolution (e.g. for the 1:1 bucket: 1024 → 512 → 256 → 128 → 64 → 32)
+- 5 downsampling stages, each halving spatial resolution (e.g. for the 1:1 bucket: 768 → 384 → 192 → 96 → 48 → 24)
 - Attention block(s) at the lowest resolution for global coherence
 - Output: continuous feature map `[B, C, H/32, W/32]` (C = latent channel dim, e.g. 256) — H and W vary by bucket
 
@@ -89,30 +89,67 @@ Standard hinge loss or non-saturating GAN loss, computed separately with its own
 
 ## Training Loop Requirements
 
-- Mixed precision (bf16) — required to fit 1024px-class training on 12GB VRAM
+- Mixed precision (bf16) — required to fit 768px-class training on 12GB VRAM
 - Gradient checkpointing on encoder/decoder — make it a toggleable flag
-- Gradient accumulation support (target effective batch size larger than what fits in VRAM at once; expect physical batch size of 2–4 images at the 1:1 (1024×1024) bucket, more at smaller buckets like 16:9)
+- **Gradient accumulation** (see below)
 - **Bucketed batch sampler**: a custom `Sampler` (or dataset wrapper) that groups images into their nearest bucket (by aspect ratio) and only yields batches where every image belongs to the same bucket. This is the mechanism that makes variable-resolution training work with standard batched tensors — do not attempt to pad/collate different-shaped images into one batch.
 - Two separate optimizers (generator params vs discriminator params), typically Adam or AdamW, separate learning rates configurable
 - Log per-step to **TensorBoard**: reconstruction loss, codebook loss, perceptual loss, adversarial loss (once active), discriminator loss (once active), codebook perplexity/usage, learning rate(s). Also log a per-bucket breakdown of these losses periodically — quality can differ meaningfully across buckets and this needs to be visible, not averaged away.
 - Periodic image logging to **TensorBoard** (via `add_images`): save side-by-side input vs reconstruction grids every N steps, cycling through a few different buckets so all aspect ratios get visually sanity-checked, not just judged by loss numbers
-- Checkpoint saving/resuming (model + optimizer + step count), since this will run over multiple sessions
-- Target total training length: 200,000–500,000 steps as a starting expectation; make this configurable, not a hard stop
+- See **Checkpointing** section below for full requirements.
+
+### Gradient Accumulation
+
+- **`batch_size`** — how many images go into VRAM at once. This is limited by hardware and differs per bucket (e.g. the 1:1 bucket at 768×768 may only allow `batch_size=2`, while 16:9 at 768×448 may allow `batch_size=8`).
+- **`accumulation_steps`** — how many batches to run before updating the model weights. Loss is accumulated over these steps instead of updating every single batch.
+- A weight update happens every `batch_size × accumulation_steps` images. Since `batch_size` differs per bucket, `accumulation_steps` should be set per bucket too, so weight updates happen over roughly the same number of images regardless of which bucket is training.
+- Log `batch_size` and `accumulation_steps` per bucket at the start of each run so it's clear from the log what each bucket is actually doing.
+
+## Training Length — Epoch-Based
+
+- **1 epoch = the model has seen every image in the training dataset once.** E.g. a 300,000-image dataset = 300,000 images seen per epoch, regardless of `batch_size`.
+- `steps_per_epoch = dataset_size / (batch_size × accumulation_steps)` — computed at runtime from the actual dataset size, not hardcoded. Since buckets have different sizes and different `batch_size`/`accumulation_steps`, compute this per bucket and sum across buckets for the run total.
+- The config knob is `target_epochs` (e.g. `30`), not a raw step count. Total steps for the run is derived from `target_epochs × steps_per_epoch`, recomputed whenever dataset size or batch settings change.
+- Changing `batch_size` or `accumulation_steps` changes how many steps make up an epoch, but does **not** change `target_epochs` — the model still sees the same amount of data per epoch either way.
+- One thing worth knowing (not something to act on now): when `batch_size × accumulation_steps` changes a lot, the learning rate sometimes needs adjusting too — bigger total batch sizes often tolerate a higher LR. Separate concern from epoch count, just flagging it in case LR instability shows up later.
+
+## Checkpointing
+
+Training on a single home GPU across multiple sessions (not a machine left running 24/7) — checkpointing is not optional polish, it's core to making this usable at all.
+
+- **Save a full checkpoint every N steps** (config value, e.g. every 250–500 steps to start, tune based on how much progress is acceptable to lose). Each checkpoint must contain everything needed to resume training identically to an uninterrupted run:
+  - Generator weights (encoder + quantizer/codebook + decoder)
+  - Discriminator weights (once Phase B has started)
+  - Generator optimizer state
+  - Discriminator optimizer state (once Phase B has started)
+  - Current step count, current epoch number, and position within the current accumulation cycle
+  - Codebook EMA state (cluster sizes, EMA embedding averages) if EMA is enabled
+  - Dead-code revival tracker state (usage counts since last revival check) so revival timing isn't reset by a resume
+  - LR scheduler state (warmup position, etc.)
+  - RNG state (torch, numpy, python random) for reproducibility across resume
+  - Config/hyperparameters used for that run (codebook size, β, bucket table, `target_epochs`, etc.) — so a checkpoint is self-describing and resuming with a mismatched config fails loudly instead of silently corrupting training
+- **Keep a rolling window of recent checkpoints** (e.g. last 3–5) plus **periodic permanent milestones** (e.g. every 5,000 or 10,000 steps, or at each epoch boundary, kept forever) — this avoids filling the disk with every single checkpoint while still protecting against a bad recent save (corruption, crash mid-write) losing all progress.
+- **Always keep a `latest.pt` (or symlink/pointer) that points to the most recent complete, verified checkpoint** — the resume command should default to "resume from latest" with no manual path-hunting required.
+- **Atomic writes**: write each checkpoint to a temp file first, then rename to the final filename only after the write completes successfully. A crash or Ctrl+C mid-save must never leave a corrupted checkpoint sitting at the path the resume logic will look for.
+- **Resume must be the default, safe path**: running the training command again (e.g. `uv run python -m vqgan.train`) should auto-detect an existing `latest.pt` in the run directory and resume from it, printing what epoch/step it's resuming from — not silently start over from epoch 0. Starting fresh should require an explicit flag (e.g. `--fresh` / `--no-resume`), not be the default behavior.
+- Log to console (and TensorBoard) whenever a checkpoint is saved and whenever a resume happens, including the epoch and step number, so it's obvious from the log alone what happened across a session boundary.
+- Best-effort save on interrupt: catch `KeyboardInterrupt` (Ctrl+C) and attempt one final checkpoint save before exiting, so a manual stop doesn't lose progress since the last periodic save.
+- Target training length: `target_epochs` in the 25–40 range as a starting expectation for COCO-minitrain-scale datasets (~25K images) — see Training Length section above. Make it configurable, not a hard stop, and recompute the derived total step count whenever dataset size changes (e.g. moving to COCO full).
 
 ## Progress Reporting
 
-- Progress bar (tqdm or similar) must display **effective steps** (post-gradient-accumulation), never fractional/physical sub-steps. Format: `current_effective_step / total_effective_steps`, both integers.
-- Step speed shown (s/step or it/s) must reflect time per **effective step** (i.e. time for one full accumulation cycle + `optimizer.step()`), using a rolling average (e.g. last 50 steps) rather than the most recent step alone — the first few steps include CUDA warmup / cuDNN autotune overhead and will skew a single-step estimate badly.
-- ETA = `(total_effective_steps - current_effective_step) × rolling_avg_seconds_per_effective_step`. Display it in the progress bar alongside step speed.
-- **`total_effective_steps` must be a fixed target independent of batch size.** If `accumulation_steps` is changed later (e.g. to fit VRAM after lowering physical batch size), `total_effective_steps` must NOT change — it represents a fixed amount of data the model should see, not a fixed number of physical batches. Physical batch size and accumulation_steps are free to vary as long as `physical_batch_size × accumulation_steps` (the effective batch size) stays constant.
-- Log the current bucket, physical batch size, accumulation_steps, and resulting effective batch size at the start of each run (and whenever they change) so past runs are auditable from the log alone.
+- Progress bar (tqdm or similar) must display **both epoch progress and step progress**, since epochs are the primary training-length unit: e.g. `Epoch 3/30 | step 4021/150000 (this run) | step 412000/4500000 (overall)`, or equivalent — epoch count must be visible, not buried behind a raw step counter the user has to mentally divide.
+- Step counts shown (current/total) must be whole steps (post-accumulation), never fractional/partial-accumulation-cycle numbers.
+- Step speed shown (s/step or it/s) must reflect time per full step (one accumulation cycle + `optimizer.step()`), using a rolling average (e.g. last 50 steps) rather than the most recent step alone — the first few steps include CUDA warmup / cuDNN autotune overhead and will skew a single-step estimate badly.
+- ETA = `(total_steps_for_target_epochs - current_step) × rolling_avg_seconds_per_step`, where `total_steps_for_target_epochs` is the derived value from the Training Length section (recomputed if `target_epochs`, dataset size, or batch settings change). Display it in the progress bar alongside step speed.
+- Log the current bucket, `batch_size`, `accumulation_steps`, dataset size, computed `steps_per_epoch`, and `target_epochs` at the start of each run (and whenever any of them change) so past runs are auditable from the log alone.
 
 ## VRAM Monitoring
 
 - Log `torch.cuda.memory_allocated()` and `torch.cuda.memory_reserved()` to TensorBoard every step (or every N steps if per-step is too noisy) — this makes VRAM headroom visible over time in the dashboard rather than only being discoverable after a slowdown or OOM.
 - If observed step time suddenly increases by a large factor (e.g. >5×) compared to the rolling average, log a warning to the console — this is the signature of VRAM spillover into shared/system memory (via PCIe), not a normal slowdown, and is worth surfacing immediately rather than silently absorbing into the rolling average.
 
-
+## Evaluation
 
 Implement an eval script separate from training that computes, on a held-out validation split:
 - **rFID** (reconstruction FID) — primary metric, target < 2.0 as a quality bar based on current published VQGAN variants. Compute both an overall rFID and a per-bucket rFID, since a bucket with less training data (e.g. extreme ratios like 16:9) may lag behind the more common ones.
@@ -126,7 +163,7 @@ Implement an eval script separate from training that computes, on a held-out val
 - Recommended starting datasets (image-only, no captions needed for this stage):
   - **COCO minitrain** (~25K images) for pipeline smoke-testing first
   - **COCO 2017 full** (~118K images) for the actual training run
-  - Note: COCO images average ~640×480 / 480×640 (a 4:3 / 3:4-ish ratio). Mapped into this bucket system they land near the 4:3 / 3:4 bucket (1024×768 / 768×1024), which is roughly a 1.6× upscale from their native resolution. This is a real quality ceiling worth being aware of — reconstructions will be limited by this upscaling no matter how well the VQGAN trains. Treat COCO as sufficient for validating that the pipeline and bucket system work correctly; consider a higher-resolution dataset (e.g. Unsplash Lite/Full) before treating final reconstruction quality numbers as representative.
+  - Note: COCO images average ~640×480 / 480×640 (a 4:3 / 3:4-ish ratio). Mapped into this bucket system they land near the 4:3 / 3:4 bucket (768×576 / 576×768), which is roughly a 1.2× upscale from their native resolution — much milder than the 1.6× upscale the earlier 1024px-max-side version required. Still worth a periodic visual check on reconstructions, but this is no longer the dominant quality ceiling it was before. Treat COCO as sufficient for validating that the pipeline and bucket system work correctly; consider a higher-resolution dataset (e.g. Unsplash Lite/Full) later if pushing back toward 1024px max side.
   - COCO's native aspect ratios cluster around 4:3/3:4 — it will not naturally populate the 1:1, 16:9, 9:16, or other buckets well. If bucket coverage matters for this training run (not just the common ratio), supplement with a source that has a wider natural spread of aspect ratios, or center-crop/pad a portion of COCO into underrepresented buckets deliberately.
 - **Bucket assignment logic**: for each image, compute its aspect ratio and assign it to the closest bucket in the table above (by ratio, not by absolute size). Resize (preserving aspect ratio) then center-crop to the bucket's exact target resolution — do not naively stretch/squash to fit, since that distorts content.
 - Preprocessing: resize+crop to assigned bucket resolution as above, standard augmentation (random crop within tolerance, horizontal flip) — no aggressive color augmentation, since the model needs to learn accurate color reproduction
@@ -155,10 +192,22 @@ vqgan/
   train.py             # main training entrypoint, argparse or config-file driven
   eval.py              # standalone evaluation script
   config.py            # dataclass or similar holding all hyperparameters, including the bucket table
+configs/
+  vqgan-multi.json      # the actual config file used to launch/resume training — see Config File Sync below
 runs/                  # tensorboard log dir (gitignored)
 pyproject.toml         # uv-managed, no pinned versions (see Constraints)
 README.md
 ```
+
+## Config File Sync
+
+`configs/vqgan-multi.json` must always reflect the **actual** hyperparameters currently in use, not just whatever was set at launch — this file is the source of truth someone reads to know what a run is really doing.
+
+- Any value that can be auto-tuned or overridden at runtime — per-bucket `batch_size`, `accumulation_steps`, `target_epochs`, LR, codebook size/β, `discriminator_start_step`, etc. — must be **written back to `configs/vqgan-multi.json`** whenever it changes, not left stale in the file while the running process silently uses a different value in memory.
+- This applies in particular to per-bucket `batch_size` auto-tuning (e.g. reducing `batch_size` after hitting VRAM limits): once the run settles on working values, the file on disk should show those actual values, not just the initial guess.
+- Same atomic-write requirement as checkpoints (see Checkpointing): write to a temp file, then rename — never leave `vqgan-multi.json` half-written if the process is interrupted mid-save.
+- On resume, load config from `configs/vqgan-multi.json` by default (consistent with checkpoint resume being the default safe path) — CLI flags can override individual values for a given run, and any such override should also be written back so the file stays current.
+- Log to console whenever `configs/vqgan-multi.json` is updated, so config changes are visible in the training log, not just silently applied.
 
 ## Constraints
 

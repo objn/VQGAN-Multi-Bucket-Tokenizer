@@ -9,7 +9,7 @@
 # Usage:
 #   ./train_uv.sh                              # uses configs/vqgan-multi.json defaults
 #   ./train_uv.sh --resume-from runs/vqgan-multi/checkpoints/latest.pt
-#   ./train_uv.sh --batch-size 2 --grad-accum-steps 8
+#   ./train_uv.sh --target-epochs 10        # per-bucket batch_size/accumulation_steps live in the config JSON
 #   VQGAN_NUM_GPUS=2 ./train_uv.sh             # DistributedDataParallel across 2 GPUs
 set -euo pipefail
 

@@ -23,6 +23,7 @@ class VectorQuantizer(nn.Module):
         use_ema: bool = False,
         ema_decay: float = 0.99,
         ema_epsilon: float = 1e-5,
+        dead_code_revival: bool = False,
     ):
         super().__init__()
         self.codebook_size = codebook_size
@@ -31,6 +32,7 @@ class VectorQuantizer(nn.Module):
         self.use_ema = use_ema
         self.ema_decay = ema_decay
         self.ema_epsilon = ema_epsilon
+        self.dead_code_revival = dead_code_revival
 
         self.embedding = nn.Embedding(codebook_size, codebook_dim)
         self.embedding.weight.data.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
@@ -41,8 +43,18 @@ class VectorQuantizer(nn.Module):
             self.register_buffer("ema_cluster_size", torch.zeros(codebook_size))
             self.register_buffer("ema_embed_avg", self.embedding.weight.data.clone())
 
-    def forward(self, z: torch.Tensor) -> dict:
-        """z: [B, C, H, W] continuous encoder output. Returns dict with quantized output and losses."""
+        # accumulating per-code usage counter for dead-code revival, reset each time
+        # _revive_dead_codes() runs -- distinct from _codebook_stats()'s per-batch `counts`,
+        # which stays a single-batch snapshot used for perplexity/codebook_usage
+        self.register_buffer("usage_count", torch.zeros(codebook_size))
+
+    def forward(self, z: torch.Tensor, revive_dead: bool = False) -> dict:
+        """z: [B, C, H, W] continuous encoder output. Returns dict with quantized output and losses.
+
+        revive_dead: if True (and dead_code_revival is enabled and self.training), reset any
+        codebook entries with zero accumulated usage since the last check to random encoder
+        vectors from this batch. Only affects future lookups, not this call's z_q/losses.
+        """
         b, c, h, w = z.shape
         assert c == self.codebook_dim, f"encoder channel dim {c} != codebook_dim {self.codebook_dim}"
 
@@ -59,6 +71,12 @@ class VectorQuantizer(nn.Module):
 
         if self.use_ema and self.training:
             self._update_ema(z_flat, indices)
+
+        num_revived = 0
+        if self.dead_code_revival and self.training:
+            self.usage_count.scatter_add_(0, indices, torch.ones_like(indices, dtype=self.usage_count.dtype))
+            if revive_dead:
+                num_revived = self._revive_dead_codes(z_flat)
 
         z_q = z_q_flat.view(b, h, w, c).permute(0, 3, 1, 2).contiguous()  # [B, C, H, W]
 
@@ -85,6 +103,7 @@ class VectorQuantizer(nn.Module):
             "indices": indices,
             "perplexity": perplexity,
             "codebook_usage": usage,
+            "num_revived": num_revived,
         }
 
     @torch.no_grad()
@@ -103,6 +122,36 @@ class VectorQuantizer(nn.Module):
             * n
         )
         self.embedding.weight.data.copy_(self.ema_embed_avg / smoothed_size.unsqueeze(1))
+
+    @torch.no_grad()
+    def _revive_dead_codes(self, z_flat: torch.Tensor) -> int:
+        """Resets codebook entries with zero accumulated usage_count to random encoder vectors
+        sampled from the current batch, then resets the accumulation window. Returns the number
+        of codes revived (0 if none were dead)."""
+        dead_mask = self.usage_count == 0
+        num_dead = int(dead_mask.sum().item())
+        if num_dead > 0:
+            n_available = z_flat.size(0)
+            if n_available >= num_dead:
+                sample_idx = torch.randperm(n_available, device=z_flat.device)[:num_dead]
+            else:
+                sample_idx = torch.randint(0, n_available, (num_dead,), device=z_flat.device)
+            # cast to the embedding's own dtype -- z_flat may be bf16 under autocast while
+            # embedding.weight/ema buffers stay float32 (autocast doesn't change parameter
+            # storage dtype), and in-place indexed assignment requires matching dtypes
+            replacement_vectors = z_flat[sample_idx].detach().clone().to(self.embedding.weight.dtype)
+            dead_idx = dead_mask.nonzero(as_tuple=True)[0]
+
+            self.embedding.weight.data[dead_idx] = replacement_vectors
+            if self.use_ema:
+                # keep ema_embed_avg consistent with the freshly-seeded weight, and give the
+                # revived code a small nonzero cluster size so the next EMA update doesn't
+                # immediately smooth it back toward its old (dead) value
+                self.ema_embed_avg[dead_idx] = replacement_vectors
+                self.ema_cluster_size[dead_idx] = 1.0
+
+        self.usage_count.zero_()  # always reset the accumulation window, even if nothing was dead
+        return num_dead
 
     @torch.no_grad()
     def _codebook_stats(self, indices: torch.Tensor) -> tuple:

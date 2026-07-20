@@ -13,9 +13,11 @@
     "num_res_blocks": 2,
     "codebook_size": 16384,
     "codebook_dim": 256,
-    "commitment_beta": 0.25,
-    "use_ema": false,
+    "commitment_beta": 0.15,
+    "use_ema": true,
     "ema_decay": 0.99,
+    "dead_code_revival": true,
+    "codebook_init": "kmeans",
     "discriminator_channels": 64,
     "discriminator_num_layers": 3
   },
@@ -31,48 +33,48 @@
     "buckets": [
       {
         "name": "1:1",
-        "width": 1024,
-        "height": 1024
-      },
-      {
-        "name": "4:5",
-        "width": 832,
-        "height": 1024
-      },
-      {
-        "name": "5:4",
-        "width": 1024,
-        "height": 832
-      },
-      {
-        "name": "4:3",
-        "width": 1024,
+        "width": 768,
         "height": 768
       },
       {
-        "name": "3:4",
+        "name": "4:5",
+        "width": 608,
+        "height": 768
+      },
+      {
+        "name": "5:4",
         "width": 768,
-        "height": 1024
+        "height": 608
       },
       {
-        "name": "3:2",
-        "width": 1024,
-        "height": 672
-      },
-      {
-        "name": "2:3",
-        "width": 672,
-        "height": 1024
-      },
-      {
-        "name": "16:9",
-        "width": 1024,
+        "name": "4:3",
+        "width": 768,
         "height": 576
       },
       {
-        "name": "9:16",
+        "name": "3:4",
         "width": 576,
-        "height": 1024
+        "height": 768
+      },
+      {
+        "name": "3:2",
+        "width": 768,
+        "height": 512
+      },
+      {
+        "name": "2:3",
+        "width": 512,
+        "height": 768
+      },
+      {
+        "name": "16:9",
+        "width": 768,
+        "height": 448
+      },
+      {
+        "name": "9:16",
+        "width": 448,
+        "height": 768
       }
     ],
     "horizontal_flip": true,
@@ -80,19 +82,25 @@
   },
   "train": {
     "output_dir": "runs/vqgan-multi",
-    "total_steps": 300000,
-    "batch_size": 4,
-    "grad_accum_steps": 5,
+    "target_epochs": 30,
+    "batch_size": 2,
+    "accumulation_steps": 8,
     "lr_generator": 4.5e-06,
     "lr_discriminator": 4.5e-06,
     "beta1": 0.5,
     "beta2": 0.9,
+    "lr_warmup_steps": 1500,
     "mixed_precision": true,
     "grad_checkpointing": true,
     "log_every": 50,
     "image_log_every": 500,
     "checkpoint_every": 2000,
     "val_every": 2000,
+    "keep_last_n_checkpoints": 5,
+    "checkpoint_milestone_every": 10000,
+    "dead_code_revival_every": 400,
+    "kmeans_init_batches": 100,
+    "kmeans_init_iters": 15,
     "num_workers": 8,
     "seed": 42,
     "resume_from": ""

@@ -32,6 +32,7 @@ class VQGAN(nn.Module):
             commitment_beta=config.commitment_beta,
             use_ema=config.use_ema,
             ema_decay=config.ema_decay,
+            dead_code_revival=config.dead_code_revival,
         )
         self.decoder = Decoder(
             out_channels=config.in_channels,
@@ -42,10 +43,13 @@ class VQGAN(nn.Module):
             grad_checkpointing=grad_checkpointing,
         )
 
-    def forward(self, x: torch.Tensor) -> dict:
-        """x: [B, 3, H, W] in [-1, 1]. Returns dict with reconstruction, quantizer loss/stats, indices."""
+    def forward(self, x: torch.Tensor, revive_dead: bool = False) -> dict:
+        """x: [B, 3, H, W] in [-1, 1]. Returns dict with reconstruction, quantizer loss/stats, indices.
+
+        revive_dead: passed through to the quantizer -- see VectorQuantizer.forward().
+        """
         z = self.encoder(x)
-        q_out = self.quantizer(z)
+        q_out = self.quantizer(z, revive_dead=revive_dead)
         x_recon = self.decoder(q_out["z_q"])
 
         return {
@@ -56,6 +60,7 @@ class VQGAN(nn.Module):
             "indices": q_out["indices"],
             "perplexity": q_out["perplexity"],
             "codebook_usage": q_out["codebook_usage"],
+            "num_revived": q_out["num_revived"],
         }
 
     @torch.no_grad()

@@ -80,7 +80,10 @@ def evaluate(checkpoint_path: str, val_dir: str, batch_size: int, num_workers: i
              max_batches_per_bucket: int | None) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    ckpt = torch.load(checkpoint_path, map_location=device)
+    # weights_only=False: our own checkpoints also carry numpy/python RNG state (not just
+    # tensors), which torch.load's default weights_only=True (PyTorch >=2.6) rejects. Safe
+    # here since these checkpoints are self-produced, not loaded from an untrusted source.
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model_config = ModelConfig(**ckpt["config"]["model"])
     bucket_dicts = ckpt["config"].get("data", {}).get("buckets")
     buckets = [Bucket(**b) for b in bucket_dicts] if bucket_dicts else list(DEFAULT_BUCKETS)

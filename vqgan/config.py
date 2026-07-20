@@ -6,6 +6,7 @@ define the schema/types and serve as the fallback when no JSON file is given.
 """
 import dataclasses
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -22,9 +23,11 @@ class ModelConfig:
 
     codebook_size: int = 16384
     codebook_dim: int = 256  # must match latent_channels
-    commitment_beta: float = 0.25
+    commitment_beta: float = 0.15
     use_ema: bool = False
     ema_decay: float = 0.99
+    dead_code_revival: bool = False
+    codebook_init: str = "uniform"  # "uniform" or "kmeans" (see run_kmeans_init() in train.py)
 
     discriminator_channels: int = 64
     discriminator_num_layers: int = 3
@@ -45,8 +48,10 @@ class LossConfig:
 class DataConfig:
     train_dir: str = "data/train"
     val_dir: str = "data/val"
-    # aspect-ratio bucket table: list of {"name", "width", "height"} (both multiples of 32,
-    # longest side 1024px). See vqgan/data/buckets.py for the Bucket type and assignment logic.
+    # aspect-ratio bucket table: list of {"name", "width", "height"} (both multiples of
+    # 32, longest side 768px). See vqgan/data/buckets.py for the Bucket type and
+    # assignment logic. batch_size/accumulation_steps are global (TrainConfig below),
+    # not per-bucket -- simpler to configure and tune than one pair per bucket.
     buckets: list = field(
         default_factory=lambda: [dataclasses.asdict(b) for b in DEFAULT_BUCKETS]
     )
@@ -57,17 +62,34 @@ class DataConfig:
 @dataclass
 class TrainConfig:
     output_dir: str = "runs/vqgan-multi"
-    total_steps: int = 300000
 
-    # uniform physical batch size across all buckets, sized to fit the largest (1:1, 1024x1024);
-    # smaller buckets use less VRAM at the same batch size (no per-bucket tuning by default)
-    batch_size: int = 3
-    grad_accum_steps: int = 5  # effective batch size = batch_size * grad_accum_steps
+    # The only training-length knob the user sets. 1 epoch = the model has seen every
+    # image in the training dataset once, regardless of batch_size (see
+    # .claude/mulit-vqgan.md, "Training Length -- Epoch-Based"). total_steps is NOT
+    # configured directly -- it's derived at startup as target_epochs *
+    # steps_per_epoch(...), recomputed every run from the actual dataset size (see
+    # steps_per_epoch() in vqgan/data/buckets.py).
+    target_epochs: int = 30
+
+    # informational/self-describing only: the total_steps actually derived and used for
+    # the most recent run, written back here at startup for auditability (see
+    # .claude/mulit-vqgan.md, "Config File Sync"). Never read as an input -- always
+    # recomputed from target_epochs + the live dataset/batch settings. Absent from a
+    # freshly-written config until the first run computes it.
+    total_steps: int = 0
+
+    # global (not per-bucket): simpler to configure/tune than a batch_size +
+    # accumulation_steps pair per bucket, at the cost of not maximizing VRAM usage on
+    # buckets smaller than the largest (1:1, 768x768) -- fine for this project's scale.
+    batch_size: int = 2
+    accumulation_steps: int = 8
 
     lr_generator: float = 4.5e-6
     lr_discriminator: float = 4.5e-6
     beta1: float = 0.5
     beta2: float = 0.9
+    lr_warmup_steps: int = 1500  # linear LR warmup, in effective steps; opt_d gets its own
+    # independent warmup window starting whenever the discriminator activates (see train.py)
 
     mixed_precision: bool = True  # bf16
     grad_checkpointing: bool = True
@@ -76,6 +98,16 @@ class TrainConfig:
     image_log_every: int = 500
     checkpoint_every: int = 2000
     val_every: int = 2000
+    keep_last_n_checkpoints: int = 5  # rolling window of recent non-milestone checkpoints to retain
+    checkpoint_milestone_every: int = 10000  # kept forever regardless of keep_last_n_checkpoints
+    dead_code_revival_every: int = 400  # effective steps between dead-code revival checks
+
+    # k-means codebook init (only used when model.codebook_init == "kmeans"): number of physical
+    # batches of encoder output to collect before running k-means, and Lloyd's-algorithm iteration
+    # count. kmeans_init_batches must be large enough that batches * tokens_per_image >= codebook_size
+    # for the smallest bucket, or k-means falls back to the uniform init with a warning.
+    kmeans_init_batches: int = 100
+    kmeans_init_iters: int = 15
 
     num_workers: int = 8
     seed: int = 42
@@ -107,9 +139,15 @@ class Config:
         return dataclasses.asdict(self)
 
     def to_json(self, path: str) -> None:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        """Atomic write (temp file + rename) -- a crash or Ctrl+C mid-write must never
+        leave configs/vqgan-multi.json half-written (see .claude/mulit-vqgan.md,
+        "Config File Sync")."""
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = p.with_suffix(p.suffix + ".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2)
+        os.replace(tmp_path, p)
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "configs" / "vqgan-multi.json"

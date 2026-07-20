@@ -15,7 +15,7 @@
 # Usage:
 #   ./train_with_coco_mini_uv.sh
 #   VQGAN_DATA_DIR=/some/local/path ./train_with_coco_mini_uv.sh
-#   ./train_with_coco_mini_uv.sh --batch-size 2 --grad-accum-steps 8
+#   ./train_with_coco_mini_uv.sh --target-epochs 10  # per-bucket batch_size/accumulation_steps live in the config JSON
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
