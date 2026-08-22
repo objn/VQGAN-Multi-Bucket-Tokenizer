@@ -1,0 +1,8 @@
+torch
+torchvision
+numpy
+pillow
+scipy      # FID computation
+tqdm       # progress bars
+lpips      # optional, only needed if use_lpips=True
+tensorboard

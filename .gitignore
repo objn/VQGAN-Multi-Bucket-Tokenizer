@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+# generated / large — not tracked in git
+/checkpoints/
+/data/
+/images/
+/outputs/
