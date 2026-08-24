@@ -21,7 +21,8 @@ class VectorQuantizer(nn.Module):
         ema_decay=0.99,
         ema_eps=1e-5,
         dead_code_threshold=1.0,   # cluster_size below this counts as "unused"
-        revive_check_every=50,     # check for dead codes every N forward calls (training only)
+        revive_check_every=800,    # check for dead codes every N *images* seen (training only)
+        reference_batch_size=16,   # the batch size ema_decay/revive_check_every are calibrated at
     ):
         super().__init__()
         self.num_embeddings = num_embeddings
@@ -32,6 +33,24 @@ class VectorQuantizer(nn.Module):
         self.ema_eps = ema_eps
         self.dead_code_threshold = dead_code_threshold
         self.revive_check_every = revive_check_every
+
+        # ema_decay/revive_check_every used to be applied per *forward call*,
+        # which silently made codebook dynamics depend on batch size: at a
+        # fixed epoch count, a smaller batch means more steps/epoch, so the
+        # EMA "forgets" old batches faster and dead-code revival fires far
+        # more often, in epoch-relative terms, than a larger batch — this is
+        # exactly what produced very different codebook-usage trajectories
+        # on two GPUs training the same dataset at batch_size=1 vs 7. Fixing
+        # this by working per-*image* instead: ema_decay is reinterpreted as
+        # calibrated at `reference_batch_size` images/step, and the actual
+        # per-step decay compounds a per-image rate by however many images
+        # were actually in this step (see forward()) — so cumulative decay
+        # after N images seen is identical regardless of how those N images
+        # were grouped into batches. revive_check_every's default is
+        # rescaled the same way (50 steps * 16 images/step, its old
+        # implicit assumption) so behavior at the reference batch size is
+        # unchanged from before.
+        self.ema_decay_per_image = ema_decay ** (1.0 / reference_batch_size)
 
         self.codebook = nn.Embedding(num_embeddings, embedding_dim)
         self.codebook.weight.data.uniform_(-1.0 / num_embeddings, 1.0 / num_embeddings)
@@ -47,6 +66,9 @@ class VectorQuantizer(nn.Module):
         # AttributeError. See set_use_ema() for how they're (re)synced.
         self.register_buffer("ema_cluster_size", torch.zeros(num_embeddings))
         self.register_buffer("ema_embed_avg", self.codebook.weight.data.clone())
+        # Despite the name (kept for checkpoint compatibility), this counts
+        # cumulative *images* seen under EMA mode, not forward calls — see
+        # the revival trigger in forward().
         self.register_buffer("_step_count", torch.zeros(1, dtype=torch.long))
 
         if self.use_ema:
@@ -74,6 +96,8 @@ class VectorQuantizer(nn.Module):
             self._step_count.zero_()
 
     def forward(self, z):
+        num_images = z.shape[0]
+
         # z: [B, C, H, W] -> [B, H, W, C] -> flatten to [B*H*W, C]
         z = z.permute(0, 2, 3, 1).contiguous()
         z_flat = z.view(-1, self.embedding_dim)
@@ -114,8 +138,11 @@ class VectorQuantizer(nn.Module):
                 )
                 batch_embed_sum.index_add_(0, token_indices_flat, z_detached.float())
 
-                self.ema_cluster_size.mul_(self.ema_decay).add_(batch_cluster_size, alpha=1 - self.ema_decay)
-                self.ema_embed_avg.mul_(self.ema_decay).add_(batch_embed_sum, alpha=1 - self.ema_decay)
+                # Per-image decay compounded by this step's actual image
+                # count, not a flat per-step constant — see __init__ for why.
+                step_decay = self.ema_decay_per_image ** num_images
+                self.ema_cluster_size.mul_(step_decay).add_(batch_cluster_size, alpha=1 - step_decay)
+                self.ema_embed_avg.mul_(step_decay).add_(batch_embed_sum, alpha=1 - step_decay)
 
                 # Laplace smoothing so cluster sizes never hit exactly zero (avoids div-by-zero)
                 n = self.ema_cluster_size.sum()
@@ -126,8 +153,16 @@ class VectorQuantizer(nn.Module):
                 new_codebook = self.ema_embed_avg / smoothed_size.unsqueeze(1)
                 self.codebook.weight.data.copy_(new_codebook)
 
-                self._step_count += 1
-                if self.revive_check_every > 0 and self._step_count.item() % self.revive_check_every == 0:
+                # revive_check_every is in images, but batches don't land
+                # exactly on multiples of it — trigger whenever this step's
+                # images crossed one (floor-div comparison), not on a
+                # modulo, so no batch size skips over a check entirely.
+                prev_images_seen = self._step_count.item()
+                self._step_count += num_images
+                if self.revive_check_every > 0 and (
+                    self._step_count.item() // self.revive_check_every
+                    > prev_images_seen // self.revive_check_every
+                ):
                     self._revive_dead_codes(z_detached)
 
             # Only a commitment loss is needed in EMA mode (codebook is updated above, not via loss)
