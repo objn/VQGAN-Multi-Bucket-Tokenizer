@@ -14,7 +14,7 @@ class VectorQuantizer(nn.Module):
 
     def __init__(
         self,
-        num_embeddings=16384,
+        num_embeddings=2048,
         embedding_dim=1024,
         beta=0.25,
         use_ema=True,           # <-- the on/off switch

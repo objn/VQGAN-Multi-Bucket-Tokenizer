@@ -8,7 +8,7 @@ from .quantizer import VectorQuantizer
 class VQGAN(nn.Module):
     """Full VQGAN wrapper: encoder + vector quantizer + decoder."""
 
-    def __init__(self, latent_dim=1024, num_embeddings=16384, use_ema=True):
+    def __init__(self, latent_dim=1024, num_embeddings=2048, use_ema=True):
         super().__init__()
         self.encoder = Encoder(latent_dim=latent_dim)
         self.quantizer = VectorQuantizer(

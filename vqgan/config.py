@@ -20,7 +20,7 @@ class VQGANTrainConfig:
     resume: str = ""  # path to a checkpoint saved by this script; "" = train from scratch
 
     latent_dim: int = 1024
-    num_embeddings: int = 16384
+    num_embeddings: int = 2048
 
     batch_size: int = 16
     num_workers: int = 4
