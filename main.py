@@ -38,7 +38,7 @@ def run_train_vqgan():
     argv = ["--data-dir", data_dir, "--epochs", epochs, "--batch-size", batch_size]
     if resume:
         argv += ["--resume", resume]
-    train_vqgan.main(argv)
+    train_vqgan.launch(argv)
 
 
 def run_evaluate():

@@ -329,10 +329,18 @@ def save_checkpoint(
     print(f"saved {path}")
 
 
-if __name__ == "__main__":
+def launch(argv=None):
+    """Detect available GPUs and either spawn one DDP process per GPU or run
+    single-process — the entry point to call (from the CLI or from
+    main.py's interactive menu) instead of main() directly, since main()
+    itself just runs on whichever rank/world_size it's given."""
     world_size = torch.cuda.device_count()
     if world_size > 1:
         print(f"detected {world_size} GPUs — launching DDP training")
-        mp.spawn(main, args=(world_size, sys.argv[1:]), nprocs=world_size, join=True)
+        mp.spawn(main, args=(world_size, argv), nprocs=world_size, join=True)
     else:
-        main(0, 1, sys.argv[1:])
+        main(0, 1, argv)
+
+
+if __name__ == "__main__":
+    launch(sys.argv[1:])
