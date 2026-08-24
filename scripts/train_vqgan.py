@@ -155,6 +155,13 @@ def main(rank: int = 0, world_size: int = 1, argv=None):
             print(f"resumed from {cfg.resume} at epoch {start_epoch} (ema_switched={ema_switched})")
 
     if distributed:
+        # Per-GPU batch size here is small (memory-constrained by the large
+        # canvas size), which makes plain BatchNorm2d's per-replica running
+        # stats noisy — sync them across all ranks so the discriminator sees
+        # stats computed over the full global batch, same as single-GPU
+        # training at the equivalent total batch size would.
+        discriminator = torch.nn.SyncBatchNorm.convert_sync_batchnorm(discriminator)
+
         # find_unused_parameters=True: the quantizer's codebook stops
         # requiring grad partway through training (the EMA warmup switch
         # below), which changes which parameters show up in the autograd

@@ -101,8 +101,14 @@ def train_step(
     # ---- Discriminator step ----
     opt_d.zero_grad(set_to_none=True)
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
-        real_logits = discriminator(real_images)
-        fake_logits = discriminator(recon.detach())
+        # One forward call on cat([real, fake]) rather than two separate
+        # calls: two BatchNorm forward passes before a single backward() is
+        # a known DDP + BatchNorm trap (each forward bumps running_mean/var
+        # in place, and the second bump can invalidate a tensor version the
+        # first forward's graph saved for backward — "modified by an
+        # inplace operation" under DDP even though single-GPU tolerates it).
+        combined_logits = discriminator(torch.cat([real_images, recon.detach()], dim=0))
+        real_logits, fake_logits = combined_logits.chunk(2, dim=0)
         d_loss = F.relu(1.0 - real_logits).mean() + F.relu(1.0 + fake_logits).mean()  # hinge loss
 
     d_loss.backward()
