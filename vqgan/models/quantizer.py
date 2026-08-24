@@ -1,6 +1,11 @@
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _distributed() -> bool:
+    return dist.is_available() and dist.is_initialized()
 
 
 class VectorQuantizer(nn.Module):
@@ -114,6 +119,16 @@ class VectorQuantizer(nn.Module):
                 )
                 batch_embed_sum.index_add_(0, token_indices_flat, z_detached.float())
 
+                if _distributed():
+                    # Each rank only sees its own shard of the batch. Sum the
+                    # per-rank cluster counts/embedding sums across all ranks
+                    # so the EMA update reflects the full global batch (not
+                    # just rank 0's local shard) — otherwise DDP's default
+                    # buffer-broadcast-from-rank-0 would silently make every
+                    # other rank's contribution to this update a no-op.
+                    dist.all_reduce(batch_cluster_size, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(batch_embed_sum, op=dist.ReduceOp.SUM)
+
                 self.ema_cluster_size.mul_(self.ema_decay).add_(batch_cluster_size, alpha=1 - self.ema_decay)
                 self.ema_embed_avg.mul_(self.ema_decay).add_(batch_embed_sum, alpha=1 - self.ema_decay)
 
@@ -160,6 +175,16 @@ class VectorQuantizer(nn.Module):
         # codebook/EMA buffers are plain float32 — indexed assignment (unlike
         # add_/mul_) requires an exact dtype match, so cast explicitly.
         replacements = z_flat[replacement_idx].to(self.codebook.weight.dtype)
+
+        if _distributed():
+            # dead_mask is identical across ranks (ema_cluster_size is kept
+            # globally in sync above), but `replacements` was drawn from
+            # each rank's own local batch — broadcast rank 0's picks so
+            # every replica revives with the same values. Unlike gradient
+            # updates, this direct buffer write isn't covered by DDP's
+            # backward-hook sync, so without this the revived rows would
+            # permanently diverge across replicas.
+            dist.broadcast(replacements, src=0)
 
         self.codebook.weight.data[dead_mask] = replacements
         self.ema_embed_avg[dead_mask] = replacements
