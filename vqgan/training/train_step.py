@@ -1,19 +1,7 @@
-import contextlib
-
 import torch
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 from ..losses.lpips_loss import LPIPS_AVAILABLE, get_lpips_model
-
-
-def _no_sync(module):
-    """Skip DDP's gradient all-reduce for a forward/backward whose grads we
-    aren't going to step with — e.g. running the discriminator on `recon`
-    just to compute the generator's adversarial loss. Those discriminator
-    grads get thrown away by opt_d.zero_grad() before the real D step, so
-    syncing them across ranks here would just be wasted communication."""
-    return module.no_sync() if isinstance(module, DDP) else contextlib.nullcontext()
 
 
 def train_step(
@@ -87,12 +75,7 @@ def train_step(
             recon_loss + vq_loss + lpips_weight * perceptual_loss + effective_disc_weight * gan_loss_g
         )
 
-    # discriminator.no_sync(): this backward also produces grads for the
-    # discriminator's parameters (fake_logits depends on them), but only
-    # opt_g.step() runs after it — those discriminator grads get discarded
-    # by opt_d.zero_grad() below, so skip syncing them across ranks here.
-    with _no_sync(discriminator):
-        g_loss.backward()
+    g_loss.backward()
     g_grad_norm = torch.nn.utils.clip_grad_norm_(
         [p for p in vqgan.parameters() if p.requires_grad], grad_clip_norm
     )
@@ -101,14 +84,8 @@ def train_step(
     # ---- Discriminator step ----
     opt_d.zero_grad(set_to_none=True)
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
-        # One forward call on cat([real, fake]) rather than two separate
-        # calls: two BatchNorm forward passes before a single backward() is
-        # a known DDP + BatchNorm trap (each forward bumps running_mean/var
-        # in place, and the second bump can invalidate a tensor version the
-        # first forward's graph saved for backward — "modified by an
-        # inplace operation" under DDP even though single-GPU tolerates it).
-        combined_logits = discriminator(torch.cat([real_images, recon.detach()], dim=0))
-        real_logits, fake_logits = combined_logits.chunk(2, dim=0)
+        real_logits = discriminator(real_images)
+        fake_logits = discriminator(recon.detach())
         d_loss = F.relu(1.0 - real_logits).mean() + F.relu(1.0 + fake_logits).mean()  # hinge loss
 
     d_loss.backward()
