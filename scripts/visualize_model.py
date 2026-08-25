@@ -1,5 +1,6 @@
-"""Write the VQGAN model graph to TensorBoard so its layers can be inspected
-visually (TensorBoard's "Graphs" tab, expandable node-by-node).
+"""Show the VQGAN's layers: a per-layer summary table (type, output shape,
+param count) printed straight to the console, plus the full model graph
+written to TensorBoard for interactive, expandable node-by-node inspection.
 
 Usage:
     python scripts/visualize_model.py --vqgan-checkpoint checkpoints/vqgan_last.pt
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
+from torchinfo import summary
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -39,6 +41,15 @@ def main(argv=None):
     vqgan.eval()  # skip the EMA codebook-update branch — only the forward pass is traced
 
     dummy_input = torch.zeros(1, 3, args.canvas_size, args.canvas_size, device=device)
+
+    model_stats = summary(
+        vqgan,
+        input_data=dummy_input,
+        depth=5,  # unroll encoder/quantizer/decoder down to individual conv/norm layers
+        col_names=("output_size", "num_params"),
+        verbose=0,  # capture the table instead of letting torchinfo print it directly
+    )
+    console.print(str(model_stats))
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

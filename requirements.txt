@@ -9,3 +9,4 @@ tensorboard
 rich
 colorama
 ipywidgets  # tqdm.auto's Jupyter progress bar needs this to render (else plain-text fallback)
+torchinfo   # per-layer model summary table
