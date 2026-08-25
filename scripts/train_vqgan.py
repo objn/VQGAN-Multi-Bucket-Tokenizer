@@ -25,10 +25,11 @@ from vqgan.models import VQGAN, PatchDiscriminator
 from vqgan.training import train_step
 
 
-def cosine_lr(step: int, total_steps: int, base_lr: float) -> float:
-    """Cosine decay from base_lr at step 0 down to ~0 at the final step."""
+def cosine_lr(step: int, total_steps: int, base_lr: float, min_lr: float = 0.0) -> float:
+    """Cosine decay from base_lr at step 0 down to min_lr at the final step —
+    never below min_lr, however low the schedule would otherwise push it."""
     progress = min(step / max(1, total_steps - 1), 1.0)
-    return 0.5 * base_lr * (1.0 + math.cos(math.pi * progress))
+    return min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * progress))
 
 
 def parse_args(argv=None) -> VQGANTrainConfig:
@@ -154,7 +155,7 @@ def main(argv=None):
             images = images.to(device, non_blocking=True)
             valid_mask = valid_mask.to(device, non_blocking=True)
 
-            lr = cosine_lr(global_step, total_steps, cfg.lr)
+            lr = cosine_lr(global_step, total_steps, cfg.lr, cfg.min_lr)
             for g in opt_g.param_groups:
                 g["lr"] = lr
             for g in opt_d.param_groups:

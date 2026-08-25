@@ -19,17 +19,18 @@ class VQGANTrainConfig:
     out_dir: str = "outputs/vqgan"
     resume: str = ""  # path to a checkpoint saved by this script; "" = train from scratch
 
-    latent_dim: int = 1024
+    latent_dim: int = 256
     num_embeddings: int = 16384
 
     batch_size: int = 7
     num_workers: int = 4
     epochs: int = 100
     lr: float = 1e-4
+    min_lr: float = 1e-6
 
     ema_warmup_epochs: int = 2          # gradient-based codebook updates before switching to EMA
     disc_warmup_epochs: float = 1.0     # epochs before adversarial loss contributes to g_loss
-    disc_weight: float = 0.5
+    disc_weight: float = 0.8
     use_lpips: bool = True
     lpips_weight: float = 1.0
 
