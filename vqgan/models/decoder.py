@@ -6,7 +6,7 @@ from .blocks import ResBlock
 class Decoder(nn.Module):
     """Quantized latent -> reconstructed image."""
 
-    def __init__(self, out_channels=3, base_channels=64, latent_dim=1024):
+    def __init__(self, out_channels=3, base_channels=64, *, latent_dim):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(latent_dim, base_channels * 4, kernel_size=3, padding=1),
