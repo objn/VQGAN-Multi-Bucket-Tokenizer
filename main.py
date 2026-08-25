@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scripts import evaluate, preprocess, train_vqgan
+from scripts import evaluate, preprocess, train_vqgan, visualize_model
 from vqgan.config import PreprocessConfig, VQGANTrainConfig
 from vqgan.display import console
 
@@ -124,6 +124,14 @@ def run_evaluate():
     evaluate.main(["--data-dir", data_dir, "--vqgan-checkpoint", vqgan_checkpoint])
 
 
+def run_visualize_model():
+    defaults = VQGANTrainConfig()
+    default_checkpoint = str(Path(defaults.checkpoint_dir) / "vqgan_last.pt")
+    vqgan_checkpoint = ask("VQGAN checkpoint", default_checkpoint)
+    canvas_size = ask("Canvas size (dummy input for tracing)", PreprocessConfig().canvas_size)
+    visualize_model.main(["--vqgan-checkpoint", vqgan_checkpoint, "--canvas-size", canvas_size])
+
+
 def main_menu():
     options = {
         "1": ("Preprocess data", run_preprocess),
@@ -131,6 +139,7 @@ def main_menu():
         "3": ("FineTune VQGAN", run_finetune_vqgan),
         "4": ("Pack Result", run_pack_result),
         "5": ("Evaluate (FID, codebook usage)", run_evaluate),
+        "6": ("Visualize model (TensorBoard graph)", run_visualize_model),
         "0": ("Exit", None),
     }
     while True:
