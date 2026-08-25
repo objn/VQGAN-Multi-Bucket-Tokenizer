@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -52,6 +53,9 @@ def main(argv=None):
     console.print(str(model_stats))
 
     out_dir = Path(args.out_dir)
+    # Start clean each run — otherwise TensorBoard's "Run" dropdown
+    # accumulates one stale entry per past visualize_model.py invocation.
+    shutil.rmtree(out_dir, ignore_errors=True)
     out_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(out_dir))
     writer.add_graph(vqgan, dummy_input)

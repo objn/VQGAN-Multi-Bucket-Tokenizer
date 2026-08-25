@@ -110,10 +110,18 @@ class VectorQuantizer(nn.Module):
         token_indices_flat = distances.argmin(dim=1)  # [B*H*W]
         z_q = self.codebook(token_indices_flat).view(z.shape)
 
-        with torch.no_grad():
-            self.usage_count.scatter_add_(
-                0, token_indices_flat, torch.ones_like(token_indices_flat, dtype=self.usage_count.dtype)
-            )
+        # Skipped while being jit-traced (torch.utils.tensorboard.add_graph,
+        # torch.onnx.export, ...): an in-place write to a buffer that isn't
+        # part of the traced inputs/outputs is a known way to make the
+        # tracer lose per-submodule scope info, collapsing what should be a
+        # nested Encoder/Quantizer/Decoder graph into a single opaque node.
+        # It's a monitoring stat only (codebook_usage_pct()) — irrelevant to
+        # a one-off architecture trace anyway.
+        if not torch.jit.is_tracing():
+            with torch.no_grad():
+                self.usage_count.scatter_add_(
+                    0, token_indices_flat, torch.ones_like(token_indices_flat, dtype=self.usage_count.dtype)
+                )
 
         if self.use_ema and self.training:
             # No-grad + scatter/index_add instead of a one_hot([B*H*W, K]) matmul:
