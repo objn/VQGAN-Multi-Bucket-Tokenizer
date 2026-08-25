@@ -10,14 +10,15 @@ def train_step(
     opt_g,
     opt_d,
     real_images,
+    *,
+    disc_weight,
+    use_lpips,
+    lpips_weight,
+    amp,
+    grad_clip_norm,
     valid_mask=None,
-    disc_weight=0.5,
-    use_lpips=True,
-    lpips_weight=1.0,
     global_step=0,
     disc_start_step=0,
-    amp=False,
-    grad_clip_norm=1.0,
 ):
     """One generator step + one discriminator step.
 

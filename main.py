@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts import evaluate, preprocess, train_vqgan
+from vqgan.config import PreprocessConfig, VQGANTrainConfig
 
 
 def ask(prompt: str, default) -> str:
@@ -24,17 +25,19 @@ def ask(prompt: str, default) -> str:
 
 
 def run_preprocess():
-    root = ask("Raw images root", "images")
-    out = ask("Output dir", "data/processed")
-    val_frac = ask("Validation fraction", "0.20")
+    defaults = PreprocessConfig()
+    root = ask("Raw images root", defaults.root)
+    out = ask("Output dir", defaults.out_dir)
+    val_frac = ask("Validation fraction", defaults.val_frac)
     preprocess.main(["--root", root, "--out", out, "--val-frac", val_frac])
 
 
 def run_train_vqgan():
-    data_dir = ask("Preprocessed data dir", "data/processed")
-    epochs = ask("Epochs", "100")
-    batch_size = ask("Batch size", "14")
-    resume = ask("Resume from checkpoint (blank = train from scratch)", "")
+    defaults = VQGANTrainConfig()
+    data_dir = ask("Preprocessed data dir", defaults.data_dir)
+    epochs = ask("Epochs", defaults.epochs)
+    batch_size = ask("Batch size", defaults.batch_size)
+    resume = ask("Resume from checkpoint (blank = train from scratch)", defaults.resume)
     argv = ["--data-dir", data_dir, "--epochs", epochs, "--batch-size", batch_size]
     if resume:
         argv += ["--resume", resume]
@@ -42,8 +45,10 @@ def run_train_vqgan():
 
 
 def run_evaluate():
-    data_dir = ask("Preprocessed data dir", "data/processed")
-    vqgan_checkpoint = ask("VQGAN checkpoint", "checkpoints/vqgan_last.pt")
+    defaults = VQGANTrainConfig()
+    data_dir = ask("Preprocessed data dir", defaults.data_dir)
+    default_checkpoint = str(Path(defaults.checkpoint_dir) / "vqgan_last.pt")
+    vqgan_checkpoint = ask("VQGAN checkpoint", default_checkpoint)
     evaluate.main(["--data-dir", data_dir, "--vqgan-checkpoint", vqgan_checkpoint])
 
 

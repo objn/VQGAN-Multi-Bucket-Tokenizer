@@ -22,7 +22,7 @@ class VQGANTrainConfig:
     latent_dim: int = 1024
     num_embeddings: int = 16384
 
-    batch_size: int = 16
+    batch_size: int = 7
     num_workers: int = 4
     epochs: int = 100
     lr: float = 1e-4
