@@ -23,6 +23,23 @@ from vqgan.display import console
 from vqgan.models import VQGAN
 
 
+class _ReconOnly(torch.nn.Module):
+    """VQGAN.forward() returns (x_recon, vq_loss, token_indices) — tracing
+    all three for add_graph routes vq_loss/token_indices (a training-only
+    scalar and a discrete index tensor, neither part of the actual layer
+    stack) all the way up to a shared multi-output node, which is what was
+    producing the extra crossing edges in the graph view. Only x_recon
+    matters for a layer diagram, so trace that alone."""
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x):
+        x_recon, _, _ = self.model(x)
+        return x_recon
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vqgan-checkpoint", default=str(Path(VQGANTrainConfig().checkpoint_dir) / "vqgan_last.pt"))
@@ -58,7 +75,7 @@ def main(argv=None):
     shutil.rmtree(out_dir, ignore_errors=True)
     out_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(out_dir))
-    writer.add_graph(vqgan, dummy_input)
+    writer.add_graph(_ReconOnly(vqgan), dummy_input)
     writer.close()
     console.print(f"[green]wrote[/green] model graph to {out_dir}")
 
