@@ -10,7 +10,12 @@ Autoregressive Transformer generation is out of scope for now — this project
 is focused on getting VQGAN encode/decode reconstruction quality right first.
 """
 
+import json
+import re
+import shutil
 import sys
+from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -19,10 +24,29 @@ from scripts import evaluate, preprocess, train_vqgan
 from vqgan.config import PreprocessConfig, VQGANTrainConfig
 from vqgan.display import console
 
+_EPOCH_CKPT_RE = re.compile(r"vqgan_epoch(\d+)\.pt")
+
 
 def ask(prompt: str, default) -> str:
     raw = input(f"{prompt} [{default}]: ").strip()
     return raw if raw else str(default)
+
+
+def latest_epoch_checkpoint(checkpoint_dir) -> str:
+    """Newest vqgan_epochXXXX.pt in checkpoint_dir by epoch number — never
+    vqgan_last.pt, which gets overwritten every run and isn't tied to a
+    specific epoch. Returns "" if none exist."""
+    checkpoint_dir = Path(checkpoint_dir)
+    if not checkpoint_dir.is_dir():
+        return ""
+    candidates = []
+    for p in checkpoint_dir.iterdir():
+        m = _EPOCH_CKPT_RE.fullmatch(p.name)
+        if m:
+            candidates.append((int(m.group(1)), p))
+    if not candidates:
+        return ""
+    return str(max(candidates, key=lambda t: t[0])[1])
 
 
 def run_preprocess():
@@ -38,11 +62,47 @@ def run_train_vqgan():
     data_dir = ask("Preprocessed data dir", defaults.data_dir)
     epochs = ask("Epochs", defaults.epochs)
     batch_size = ask("Batch size", defaults.batch_size)
-    resume = ask("Resume from checkpoint (blank = train from scratch)", defaults.resume)
+    resume_default = latest_epoch_checkpoint(defaults.checkpoint_dir) or defaults.resume
+    resume = ask("Resume from checkpoint (blank = train from scratch)", resume_default)
     argv = ["--data-dir", data_dir, "--epochs", epochs, "--batch-size", batch_size]
     if resume:
         argv += ["--resume", resume]
     train_vqgan.main(argv)
+
+
+def run_finetune_vqgan():
+    console.print("[yellow]FineTune VQGAN: not implemented yet[/yellow]")
+
+
+def run_pack_result():
+    defaults = VQGANTrainConfig()
+    out_dir = Path(defaults.out_dir)
+    checkpoint_dir = Path(defaults.checkpoint_dir)
+
+    result_dir = out_dir / f"result_{datetime.now():%Y%m%d_%H%M%S}"
+    result_dir.mkdir(parents=True, exist_ok=True)
+    console.print(f"[green]created[/green] {result_dir}")
+
+    config_path = result_dir / "config.json"
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(asdict(defaults), f, indent=2)
+    console.print(f"[green]wrote[/green] {config_path}")
+
+    recon_files = sorted(out_dir.glob("recon_epoch*.png")) if out_dir.is_dir() else []
+    for p in recon_files:
+        shutil.move(str(p), str(result_dir / p.name))
+    if recon_files:
+        console.print(f"[green]moved[/green] {len(recon_files)} recon image(s) to {result_dir}")
+    else:
+        console.print("[yellow]no recon_epoch*.png files found[/yellow]")
+
+    latest_ckpt = latest_epoch_checkpoint(checkpoint_dir)
+    if latest_ckpt:
+        latest_ckpt = Path(latest_ckpt)
+        shutil.move(str(latest_ckpt), str(result_dir / latest_ckpt.name))
+        console.print(f"[green]moved[/green] {latest_ckpt.name} to {result_dir}")
+    else:
+        console.print("[yellow]no vqgan_epoch*.pt checkpoint found (vqgan_last.pt is left alone)[/yellow]")
 
 
 def run_evaluate():
@@ -57,7 +117,9 @@ def main_menu():
     options = {
         "1": ("Preprocess data", run_preprocess),
         "2": ("Train VQGAN", run_train_vqgan),
-        "3": ("Evaluate (FID, codebook usage)", run_evaluate),
+        "3": ("FineTune VQGAN", run_finetune_vqgan),
+        "4": ("Pack Result", run_pack_result),
+        "5": ("Evaluate (FID, codebook usage)", run_evaluate),
         "0": ("Exit", None),
     }
     while True:
