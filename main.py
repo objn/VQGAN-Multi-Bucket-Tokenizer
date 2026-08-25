@@ -62,8 +62,19 @@ def run_train_vqgan():
     data_dir = ask("Preprocessed data dir", defaults.data_dir)
     epochs = ask("Epochs", defaults.epochs)
     batch_size = ask("Batch size", defaults.batch_size)
-    resume_default = latest_epoch_checkpoint(defaults.checkpoint_dir) or defaults.resume
-    resume = ask("Resume from checkpoint (blank = train from scratch)", resume_default)
+
+    resume_default = latest_epoch_checkpoint(defaults.checkpoint_dir)
+    if resume_default:
+        # ask() returns the bracketed default on blank input (same as every
+        # other prompt here), so once a checkpoint is found, blank now means
+        # "use it" — not "train from scratch" like the old hint text said.
+        # "scratch" is the explicit escape hatch for the from-scratch case.
+        resume = ask("Resume from checkpoint (blank = use this, or type 'scratch')", resume_default)
+        if resume.strip().lower() == "scratch":
+            resume = ""
+    else:
+        resume = ask("Resume from checkpoint (blank = train from scratch)", defaults.resume)
+
     argv = ["--data-dir", data_dir, "--epochs", epochs, "--batch-size", batch_size]
     if resume:
         argv += ["--resume", resume]
