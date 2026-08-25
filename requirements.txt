@@ -6,3 +6,6 @@ scipy      # FID computation
 tqdm       # progress bars
 lpips      # optional, only needed if use_lpips=True
 tensorboard
+rich
+colorama
+ipywidgets  # tqdm.auto's Jupyter progress bar needs this to render (else plain-text fallback)

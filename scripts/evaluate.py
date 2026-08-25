@@ -13,11 +13,11 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid, save_image
-from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from vqgan.data import PixelDataset
+from vqgan.display import console, tqdm
 from vqgan.eval import compute_statistics, extract_features, fid_from_stats, get_feature_extractor
 from vqgan.models import VQGAN
 
@@ -68,15 +68,15 @@ def main(argv=None):
     fid = fid_from_stats(mu_r, sigma_r, mu_f, sigma_f)
 
     usage_pct = vqgan.quantizer.codebook_usage_pct()
-    print(f"FID (real vs. recon): {fid:.3f}")
-    print(f"codebook usage: {usage_pct:.1f}%")
+    console.print(f"[bold]FID[/bold] (real vs. recon): {fid:.3f}")
+    console.print(f"[bold]codebook usage[/bold]: {usage_pct:.1f}%")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     real, recon = first_batch
     grid = make_grid(torch.cat([real, recon], dim=0), nrow=real.shape[0])
     save_image((grid + 1) / 2, out_dir / "vqgan_spotcheck.png")
-    print(f"saved {out_dir / 'vqgan_spotcheck.png'}")
+    console.print(f"[green]saved[/green] {out_dir / 'vqgan_spotcheck.png'}")
 
 
 if __name__ == "__main__":

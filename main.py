@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts import evaluate, preprocess, train_vqgan
 from vqgan.config import PreprocessConfig, VQGANTrainConfig
+from vqgan.display import console
 
 
 def ask(prompt: str, default) -> str:
@@ -60,22 +61,22 @@ def main_menu():
         "0": ("Exit", None),
     }
     while True:
-        print("\n=== VQGAN pipeline ===")
+        console.print("\n[bold]=== VQGAN pipeline ===[/bold]")
         for key, (label, _) in options.items():
-            print(f"  {key}) {label}")
+            console.print(f"  {key}) {label}")
         choice = input("> ").strip()
         if choice == "0" or choice not in options:
-            print("bye")
+            console.print("bye")
             return
         _, action = options[choice]
         try:
             action()
         except Exception as e:  # keep the menu alive after a failed stage
-            print(f"error: {e}")
+            console.print(f"[red]error:[/red] {e}")
 
 
 if __name__ == "__main__":
     try:
         main_menu()
     except (EOFError, KeyboardInterrupt):
-        print("\nbye")
+        console.print("\nbye")

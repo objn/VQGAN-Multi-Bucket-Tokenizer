@@ -13,7 +13,6 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -24,6 +23,7 @@ from vqgan.data.preprocessing import (
     passes_resolution_filter,
     resize_and_crop,
 )
+from vqgan.display import console, tqdm
 
 
 def parse_args(argv=None) -> PreprocessConfig:
@@ -46,7 +46,7 @@ def main(argv=None):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     discovered = discover_images(cfg.root)
-    print(f"discovered {len(discovered)} candidate images under {cfg.root}")
+    console.print(f"discovered {len(discovered)} candidate images under {cfg.root}")
 
     kept_records = []
     canvases = []
@@ -87,12 +87,12 @@ def main(argv=None):
         )
 
     n_kept = len(kept_records)
-    print(
+    console.print(
         f"kept {n_kept} images "
         f"(dropped {n_corrupt} corrupt/unreadable, {n_too_small} below min-short-side)"
     )
     if n_kept == 0:
-        print("nothing to write, exiting")
+        console.print("[yellow]nothing to write, exiting[/yellow]")
         return
 
     pixels_path = out_dir / "pixels.npy"
@@ -125,8 +125,8 @@ def main(argv=None):
     with open(splits_path, "w", encoding="utf-8") as f:
         json.dump({"train": train_idx, "val": val_idx}, f)
 
-    print(f"train: {len(train_idx)}  val: {len(val_idx)}")
-    print(f"wrote {pixels_path}, {metadata_path}, {splits_path}")
+    console.print(f"train: {len(train_idx)}  val: {len(val_idx)}")
+    console.print(f"[green]wrote[/green] {pixels_path}, {metadata_path}, {splits_path}")
 
     config_path = out_dir / "preprocess_config.json"
     with open(config_path, "w", encoding="utf-8") as f:

@@ -15,12 +15,12 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import make_grid, save_image
-from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from vqgan.config import VQGANTrainConfig
 from vqgan.data import PixelDataset
+from vqgan.display import console, tqdm
 from vqgan.models import VQGAN, PatchDiscriminator
 from vqgan.training import train_step
 
@@ -66,7 +66,7 @@ def main(argv=None):
         val_ds, batch_size=cfg.batch_size, shuffle=False,
         num_workers=cfg.num_workers, pin_memory=True,
     )
-    print(f"train: {len(train_ds)}  val: {len(val_ds)}")
+    console.print(f"train: {len(train_ds)}  val: {len(val_ds)}")
 
     start_epoch = 0
     global_step = 0
@@ -84,8 +84,8 @@ def main(argv=None):
         latent_dim = resume_ckpt["latent_dim"]
         num_embeddings = resume_ckpt["num_embeddings"]
         if latent_dim != cfg.latent_dim or num_embeddings != cfg.num_embeddings:
-            print(
-                f"resume: overriding --latent-dim/--num-embeddings with checkpoint's "
+            console.print(
+                f"[yellow]resume:[/yellow] overriding --latent-dim/--num-embeddings with checkpoint's "
                 f"own values ({latent_dim}, {num_embeddings})"
             )
 
@@ -110,7 +110,7 @@ def main(argv=None):
 
         start_epoch = resume_ckpt["epoch"] + 1
         global_step = resume_ckpt.get("global_step", start_epoch * len(train_loader))
-        print(f"resumed from {cfg.resume} at epoch {start_epoch} (ema_switched={ema_switched})")
+        console.print(f"resumed from {cfg.resume} at epoch {start_epoch} (ema_switched={ema_switched})")
 
     opt_g = torch.optim.Adam(
         filter(lambda p: p.requires_grad, vqgan.parameters()), lr=cfg.lr, betas=(0.5, 0.9)
@@ -134,9 +134,9 @@ def main(argv=None):
     tb_writer = SummaryWriter(log_dir=str(tb_log_dir))
     try:
         subprocess.Popen(["tensorboard", "--logdir", str(tb_log_dir), "--port", "6006"])
-        print("tensorboard: http://localhost:6006")
+        console.print("[cyan]tensorboard:[/cyan] http://localhost:6006")
     except FileNotFoundError:
-        print(f"tensorboard CLI not found on PATH — logs are still written to {tb_log_dir}")
+        console.print(f"[yellow]tensorboard CLI not found on PATH[/yellow] — logs are still written to {tb_log_dir}")
 
     for epoch in range(start_epoch, cfg.epochs):
         if not ema_switched and epoch >= cfg.ema_warmup_epochs:
@@ -145,7 +145,7 @@ def main(argv=None):
                 filter(lambda p: p.requires_grad, vqgan.parameters()), lr=cfg.lr, betas=(0.5, 0.9)
             )
             ema_switched = True
-            print(f"epoch {epoch}: switched quantizer to EMA mode")
+            console.print(f"epoch {epoch}: [bold cyan]switched quantizer to EMA mode[/bold cyan]")
 
         vqgan.train()
         discriminator.train()
@@ -184,7 +184,7 @@ def main(argv=None):
                 pbar.set_postfix(postfix)
 
         usage_pct = vqgan.quantizer.codebook_usage_pct()
-        print(f"epoch {epoch}: codebook usage {usage_pct:.1f}%")
+        console.print(f"epoch {epoch}: codebook usage {usage_pct:.1f}%")
         vqgan.quantizer.reset_usage_stats()
 
         epoch_avg = {k: v / steps_per_epoch for k, v in running.items()}
@@ -220,7 +220,7 @@ def evaluate(vqgan, val_loader, device, out_dir, epoch, fixed_val_images, tb_wri
         total_l1 += (recon - images).abs().mean().item() * images.shape[0]
         n += images.shape[0]
     val_l1 = total_l1 / max(n, 1)
-    print(f"epoch {epoch}: val L1 {val_l1:.4f}")
+    console.print(f"epoch {epoch}: val L1 {val_l1:.4f}")
     tb_writer.add_scalar("val/l1", val_l1, epoch)
 
     recon, _, _ = vqgan(fixed_val_images)
@@ -248,7 +248,7 @@ def save_checkpoint(
         "num_embeddings": num_embeddings,
     }
     torch.save(ckpt, path)
-    print(f"saved {path}")
+    console.print(f"[green]saved[/green] {path}")
 
 
 if __name__ == "__main__":
