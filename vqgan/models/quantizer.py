@@ -4,7 +4,18 @@ import torch.nn.functional as F
 
 
 class VectorQuantizer(nn.Module):
-    """The "VQ" in VQGAN.
+    """The "VQ" in ViT-VQGAN.
+
+    Two ViT-VQGAN-specific details on top of a plain VQ layer:
+
+      - *Factorized* codes: `embedding_dim` is deliberately small (32) compared
+        to the transformer's width (768). The encoder projects down to this
+        space before lookup, which is what keeps nearest-neighbour search
+        well-conditioned and codebook usage high.
+      - *L2-normalized* codes (`l2_normalize=True`): both the encoded latents
+        and the codebook entries are projected onto the unit sphere, so squared
+        euclidean distance becomes 2 - 2*cosine — lookup is cosine similarity,
+        and code magnitude can't drift.
 
     Supports two codebook update modes, chosen with `use_ema`:
       - use_ema=False : original gradient-based update (codebook_loss backprop)
@@ -17,10 +28,11 @@ class VectorQuantizer(nn.Module):
         num_embeddings,
         embedding_dim,
         beta=0.25,
+        l2_normalize=True,      # project latents + codes onto the unit sphere
         use_ema=True,           # <-- the on/off switch
         ema_decay=0.99,
         ema_eps=1e-5,
-        dead_code_threshold=1.0,   # cluster_size below this counts as "unused"
+        dead_code_fraction=0.1,    # "used less than 10% as often as a uniformly-used code"
         revive_check_every=800,    # check for dead codes every N *images* seen (training only)
         reference_batch_size=16,   # the batch size ema_decay/revive_check_every are calibrated at
     ):
@@ -28,10 +40,20 @@ class VectorQuantizer(nn.Module):
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.beta = beta
+        self.l2_normalize = l2_normalize
         self.use_ema = use_ema
         self.ema_decay = ema_decay
         self.ema_eps = ema_eps
-        self.dead_code_threshold = dead_code_threshold
+        # A *fraction of uniform usage* rather than an absolute cluster size.
+        # ema_cluster_size settles around (tokens per step) / num_embeddings for
+        # a healthy codebook, which is 2.0 here (1024 tokens x batch 16 / 8192
+        # codes) but was ~7 for the old 128x128 CNN latent grid — so the old
+        # absolute threshold of 1.0 goes from "an eighth of average" to "half of
+        # average" purely because the architecture changed, and would condemn
+        # half of a perfectly healthy codebook every check. Scaling by the mean
+        # keeps the criterion the same regardless of token grid, batch size or
+        # codebook size, exactly like the per-image EMA decay above.
+        self.dead_code_fraction = dead_code_fraction
         self.revive_check_every = revive_check_every
 
         # ema_decay/revive_check_every used to be applied per *forward call*,
@@ -54,6 +76,11 @@ class VectorQuantizer(nn.Module):
 
         self.codebook = nn.Embedding(num_embeddings, embedding_dim)
         self.codebook.weight.data.uniform_(-1.0 / num_embeddings, 1.0 / num_embeddings)
+        if self.l2_normalize:
+            # Start on the unit sphere too, otherwise the first lookups compare
+            # unit-norm latents against near-zero codes and every position
+            # collapses onto whichever entry happens to be largest.
+            self.codebook.weight.data.copy_(F.normalize(self.codebook.weight.data, dim=-1))
 
         # Usage tracking (independent of use_ema, which only maintains
         # ema_cluster_size when EMA mode is on) so codebook health can be
@@ -76,6 +103,14 @@ class VectorQuantizer(nn.Module):
             # so we freeze them here and update the buffers manually in forward().
             self.codebook.weight.requires_grad_(False)
 
+    def codebook_vectors(self):
+        """The codebook as actually used for lookup. Normalizing on read (rather
+        than only when writing) means gradient-mode updates stay on the sphere
+        too — the raw parameter's magnitude simply stops mattering."""
+        if self.l2_normalize:
+            return F.normalize(self.codebook.weight, dim=-1)
+        return self.codebook.weight
+
     def set_use_ema(self, flag: bool):
         """Flip EMA mode on/off at runtime (e.g. warm up with gradient updates,
         then switch to EMA once the encoder has stabilized)."""
@@ -97,18 +132,26 @@ class VectorQuantizer(nn.Module):
 
     def forward(self, z):
         num_images = z.shape[0]
+        embed = self.codebook_vectors()
 
         # z: [B, C, H, W] -> [B, H, W, C] -> flatten to [B*H*W, C]
         z = z.permute(0, 2, 3, 1).contiguous()
         z_flat = z.view(-1, self.embedding_dim)
+        if self.l2_normalize:
+            # Normalize before the lookup and keep the normalized tensor as
+            # *the* latent from here on, so the commitment loss and the
+            # straight-through estimator both operate in the same space the
+            # nearest-neighbour search did.
+            z_flat = F.normalize(z_flat, dim=-1)
+            z = z_flat.view(z.shape)
 
         distances = (
             z_flat.pow(2).sum(1, keepdim=True)
-            - 2 * z_flat @ self.codebook.weight.t()
-            + self.codebook.weight.pow(2).sum(1)
+            - 2 * z_flat @ embed.t()
+            + embed.pow(2).sum(1)
         )
         token_indices_flat = distances.argmin(dim=1)  # [B*H*W]
-        z_q = self.codebook(token_indices_flat).view(z.shape)
+        z_q = F.embedding(token_indices_flat, embed).view(z.shape)
 
         # Skipped while being jit-traced (torch.utils.tensorboard.add_graph,
         # torch.onnx.export, ...): an in-place write to a buffer that isn't
@@ -159,6 +202,8 @@ class VectorQuantizer(nn.Module):
                     / (n + self.num_embeddings * self.ema_eps) * n
                 )
                 new_codebook = self.ema_embed_avg / smoothed_size.unsqueeze(1)
+                if self.l2_normalize:
+                    new_codebook = F.normalize(new_codebook, dim=-1)
                 self.codebook.weight.data.copy_(new_codebook)
 
                 # revive_check_every is in images, but batches don't land
@@ -192,8 +237,12 @@ class VectorQuantizer(nn.Module):
     def _revive_dead_codes(self, z_flat):
         """Reinitialize codebook entries that are barely ever used with real
         latent vectors sampled from the current batch, so they land somewhere
-        the encoder actually produces instead of a meaningless random spot."""
-        dead_mask = self.ema_cluster_size < self.dead_code_threshold
+        the encoder actually produces instead of a meaningless random spot.
+
+        `z_flat` is already unit-norm when l2_normalize is on, so the
+        replacements land on the sphere along with the rest of the codebook."""
+        threshold = self.dead_code_fraction * self.ema_cluster_size.mean()
+        dead_mask = self.ema_cluster_size < threshold
         num_dead = int(dead_mask.sum().item())
         if num_dead == 0:
             return
@@ -204,9 +253,14 @@ class VectorQuantizer(nn.Module):
         # add_/mul_) requires an exact dtype match, so cast explicitly.
         replacements = z_flat[replacement_idx].to(self.codebook.weight.dtype)
 
+        # Seed the revived entry right on the "just barely alive" line rather
+        # than at an absolute count, for the same scale-independence reason as
+        # the threshold itself. ema_embed_avg is a *weighted* sum, so it has to
+        # carry the same factor for `ema_embed_avg / cluster_size` to hand back
+        # the replacement vector unchanged.
         self.codebook.weight.data[dead_mask] = replacements
-        self.ema_embed_avg[dead_mask] = replacements
-        self.ema_cluster_size[dead_mask] = 1.0  # give it a fresh, small but non-zero count
+        self.ema_cluster_size[dead_mask] = threshold
+        self.ema_embed_avg[dead_mask] = replacements * threshold
 
     def codebook_usage_pct(self) -> float:
         """Fraction of codebook entries used at least once since the last

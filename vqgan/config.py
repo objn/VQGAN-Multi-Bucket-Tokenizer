@@ -2,42 +2,114 @@ from dataclasses import dataclass
 
 
 @dataclass
-class PreprocessConfig:
-    root: str = "images"
-    out_dir: str = "data/processed"
-    canvas_size: int = 1024
-    min_short_side: int = 256
-    downsample_factor: int = 8
-    val_frac: float = 0.20
+class DataConfig:
+    """Inputs to scripts/build_index.py — which files exist and how they split.
+
+    Everything about how those files are *read* during training (crop size,
+    shuffle buffer, ...) lives in VQGANTrainConfig instead, so there is exactly
+    one place to change each knob.
+    """
+
+    manifest_dir: str = "images-parquet"   # *.json pointers to parquet datasets on other disks
+    folder_root: str = "images"            # drop your own images here
+    index_path: str = "data/index.json"
+
+    # Only applies to `folder_root`; the parquet datasets ship their own splits.
+    val_frac: float = 0.05
+    test_frac: float = 0.05
     seed: int = 0
 
 
 @dataclass
 class VQGANTrainConfig:
-    data_dir: str = "data/processed"
+    index_path: str = "data/index.json"
     checkpoint_dir: str = "checkpoints"
     out_dir: str = "outputs/vqgan"
     resume: str = ""  # path to a checkpoint saved by this script; "" = train from scratch
 
-    latent_dim: int = 256
-    num_embeddings: int = 16384
+    # ViT-VQGAN architecture. tile_size/patch_size fix the token grid at
+    # (tile_size/patch_size)^2 = 1024 tokens, which is what the paper trains at
+    # and what fits comfortably in 12GB.
+    tile_size: int = 256
+    patch_size: int = 8
+    model_dim: int = 768
+    depth: int = 8
+    num_heads: int = 12
+    mlp_ratio: float = 4.0
+    code_dim: int = 32            # factorized: lookup happens in this space, not model_dim
+    num_embeddings: int = 8192
 
-    batch_size: int = 7
+    # Measured on a 12GB RTX 3080 Ti, at tile_size 256 with LPIPS on. Peak
+    # memory reserved by torch, before the ~1.5GB the desktop already holds:
+    #
+    #   batch  4 ->  4.8GB   27.2 crops/s
+    #   batch  8 ->  7.8GB   30.3 crops/s
+    #   batch 12 -> 10.5GB   31.4 crops/s   (12.0GB with the desktop: too close)
+    #   batch 16 -> 13.5GB    0.3 crops/s   (over the card; on Windows the WDDM
+    #                                        driver spills to host RAM over PCIe
+    #                                        instead of raising OutOfMemoryError,
+    #                                        so this does not crash, it just runs
+    #                                        180x slower)
+    #
+    # Throughput has already plateaued by 8 — this is compute-bound, not
+    # batch-bound, so a larger batch buys ~3% for 2.7GB and a spill risk.
+    batch_size: int = 8
+    # The loader streams ~1100 crops/s with 6 workers against a GPU that eats
+    # ~30, so it is nowhere near the bottleneck; 4 keeps a 6x margin while
+    # holding ~3GB less host RAM in parquet buffers.
     num_workers: int = 4
-    epochs: int = 100
+    crops_per_image: int = 2      # amortizes the JPEG decode
+    shuffle_buffer: int = 1024
+    val_images: int = 512         # fixed center crops held in RAM for stable metrics
+
+    # Schedule is in optimizer steps, not epochs: one pass over ImageNet-1k is
+    # ~80k steps at this batch size, so "epoch" is too coarse a unit to
+    # checkpoint, evaluate or warm up on.
+    max_steps: int = 200_000
+    # 0 = EMA codebook updates from the very first step. The old pipeline warmed
+    # up with gradient-based updates first, on the theory that EMA from step 0
+    # locks in a noisy encoder — but measured over 1500 steps that warmup is
+    # actively harmful here: gradient updates alone never break the initial
+    # index collapse (codebook usage sat at 0.0-0.1% for the whole warmup, so
+    # the encoder was training through a one-code bottleneck and val L1 *rose*,
+    # 0.377 -> 0.490), and only EMA plus dead-code revival pulled it out. With
+    # warmup off, val L1 at step 250 already beat what the warmed-up run reached
+    # at step 1500 (0.238 vs 0.233 at 6x the steps) and codebook usage ended
+    # higher (61% vs 52%). Set this above 0 to get the old behavior back.
+    ema_warmup_steps: int = 0
+    disc_warmup_steps: int = 10_000   # steps before adversarial loss contributes to g_loss
+    eval_every_steps: int = 2_000
+    checkpoint_every_steps: int = 5_000
+    log_every: int = 50
+
     lr: float = 1e-4
     min_lr: float = 1e-6
 
-    ema_warmup_epochs: int = 2          # gradient-based codebook updates before switching to EMA
-    disc_warmup_epochs: float = 1.0     # epochs before adversarial loss contributes to g_loss
-    disc_weight: float = 0.8
+    # ViT-VQGAN loss weights.
+    l2_weight: float = 1.0
+    logit_laplace_weight: float = 0.1
+    lpips_weight: float = 0.1
+    disc_weight: float = 0.1
     use_lpips: bool = True
-    lpips_weight: float = 1.0
 
     amp: bool = True            # autocast + train in bf16 (no GradScaler needed for bf16)
     grad_clip_norm: float = 1.0
-    log_every: int = 50
-    eval_every_epochs: int = 1
-    checkpoint_every_epochs: int = 5
 
     seed: int = 0
+
+    def model_config(self) -> dict:
+        """The subset of this config that defines the network's shape.
+
+        Stored inside every checkpoint so a checkpoint can be rebuilt without
+        guessing at whatever the config defaults happen to be at load time.
+        """
+        return {
+            "image_size": self.tile_size,
+            "patch_size": self.patch_size,
+            "model_dim": self.model_dim,
+            "depth": self.depth,
+            "num_heads": self.num_heads,
+            "mlp_ratio": self.mlp_ratio,
+            "code_dim": self.code_dim,
+            "num_embeddings": self.num_embeddings,
+        }

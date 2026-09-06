@@ -1,0 +1,41 @@
+name: vqgan
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      # The cu130 wheels bundle their own CUDA runtime, so they do not have to
+      # match the CUDA toolkit installed on the machine — only the driver does.
+      #
+      # The +cu130 local version tag is load-bearing: without it pip compares
+      # versions across both indexes, finds a plain "torch==2.14.0" on PyPI, and
+      # silently installs the CPU-only build. Pinning the tag means only the
+      # PyTorch index can satisfy the requirement.
+      - --extra-index-url https://download.pytorch.org/whl/cu130
+      - torch==2.9.1+cu130
+      - torchvision==0.24.1+cu130   # the version cu130 index pairs with torch 2.9.1
+      - numpy
+      - pillow
+      - pyarrow
+      - scipy
+      - tqdm
+      - lpips
+      - tensorboard
+      - rich
+      - ipywidgets
+      - torchinfo
+      # Requested for the environment. Note that the attention in
+      # vqgan/models/transformer.py goes through
+      # torch.nn.functional.scaled_dot_product_attention, which already
+      # dispatches to the same flash / memory-efficient kernels, so nothing in
+      # this repo imports xformers today.
+      #
+      # Pinned to the one release PyPI's metadata declares for torch==2.9.1
+      # (xformers pins an exact torch version per release: 0.0.34 wants
+      # 2.10.0, 0.0.32.post2 wants 2.8.0, ...) — otherwise pip grabs latest
+      # and errors on the torch mismatch. Even matched, the PyPI wheel is only
+      # built for Python 3.10 + CUDA 12.8, so on this Python 3.12 / cu130
+      # setup it loads without its compiled extensions (a logged warning, not
+      # an error) — irrelevant here since nothing imports it.
+      - xformers==0.0.33.post2

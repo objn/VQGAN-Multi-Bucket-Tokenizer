@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-from ..losses.lpips_loss import LPIPS_AVAILABLE, get_lpips_model
+from ..losses import LPIPS_AVAILABLE, get_lpips_model, logit_laplace_nll
 
 
 def train_step(
@@ -11,21 +11,22 @@ def train_step(
     opt_d,
     real_images,
     *,
+    l2_weight,
+    logit_laplace_weight,
+    lpips_weight,
     disc_weight,
     use_lpips,
-    lpips_weight,
     amp,
     grad_clip_norm,
-    valid_mask=None,
     global_step=0,
     disc_start_step=0,
 ):
     """One generator step + one discriminator step.
 
-    `valid_mask` ([B,1,H,W], 1=real content / 0=pad margin) confines the L1 and
-    LPIPS reconstruction losses to each image's valid region, so the model
-    isn't rewarded/penalized for the black padding margin. Pass None to fall
-    back to whole-canvas losses.
+    The generator loss is ViT-VQGAN's: L2 + logit-Laplace + LPIPS + hinge GAN,
+    weighted 1.0 / 0.1 / 0.1 / 0.1 by default, plus the quantizer's own VQ
+    term. Every crop is full of real pixels (tiles are shifted inward at the
+    image edge rather than padded), so nothing needs masking out.
 
     `global_step`/`disc_start_step` implement discriminator warmup: before
     `disc_start_step`, the adversarial term is excluded from the generator
@@ -46,34 +47,34 @@ def train_step(
     device = real_images.device
     device_type = device.type
     effective_disc_weight = disc_weight if global_step >= disc_start_step else 0.0
+    lpips_on = use_lpips and LPIPS_AVAILABLE
 
     # ---- Generator (encoder+quantizer+decoder) step ----
     opt_g.zero_grad(set_to_none=True)
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
-        recon, vq_loss, _ = vqgan(real_images)
+        out = vqgan(real_images)
 
-        if valid_mask is not None:
-            diff = (recon - real_images).abs() * valid_mask
-            num_valid = (valid_mask.sum() * real_images.shape[1]).clamp(min=1)
-            recon_loss = diff.sum() / num_valid
-        else:
-            recon_loss = F.l1_loss(recon, real_images)
+        recon_loss = F.mse_loss(out.recon, real_images)
+        # The logit-Laplace term is computed in fp32: it takes a log and an
+        # exp of the decoder's raw scale head, and bf16 has too few mantissa
+        # bits for log1p(-x) near the edges of the pixel range.
+        laplace_loss = logit_laplace_nll(out.mu.float(), out.log_b.float(), real_images.float())
 
-        if use_lpips and LPIPS_AVAILABLE:
+        if lpips_on:
             lpips_model = get_lpips_model(device)
-            lpips_map = lpips_model(recon, real_images)  # [B,1,H,W], expects inputs in [-1, 1]
-            if valid_mask is not None:
-                perceptual_loss = (lpips_map * valid_mask).sum() / valid_mask.sum().clamp(min=1)
-            else:
-                perceptual_loss = lpips_map.mean()
+            perceptual_loss = lpips_model(out.recon, real_images).mean()  # inputs in [-1, 1]
         else:
             perceptual_loss = torch.tensor(0.0, device=device)
 
-        fake_logits = discriminator(recon)
+        fake_logits = discriminator(out.recon)
         gan_loss_g = -fake_logits.mean()  # fool the discriminator
 
         g_loss = (
-            recon_loss + vq_loss + lpips_weight * perceptual_loss + effective_disc_weight * gan_loss_g
+            l2_weight * recon_loss
+            + logit_laplace_weight * laplace_loss
+            + out.vq_loss
+            + lpips_weight * perceptual_loss
+            + effective_disc_weight * gan_loss_g
         )
 
     g_loss.backward()
@@ -86,7 +87,7 @@ def train_step(
     opt_d.zero_grad(set_to_none=True)
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
         real_logits = discriminator(real_images)
-        fake_logits = discriminator(recon.detach())
+        fake_logits = discriminator(out.recon.detach())
         d_loss = F.relu(1.0 - real_logits).mean() + F.relu(1.0 + fake_logits).mean()  # hinge loss
 
     d_loss.backward()
@@ -95,8 +96,9 @@ def train_step(
 
     return {
         "recon_loss": recon_loss.item(),
-        "lpips_loss": perceptual_loss.item() if use_lpips and LPIPS_AVAILABLE else None,
-        "vq_loss": vq_loss.item(),
+        "laplace_loss": laplace_loss.item(),
+        "lpips_loss": perceptual_loss.item() if lpips_on else None,
+        "vq_loss": out.vq_loss.item(),
         "g_loss": g_loss.item(),
         "d_loss": d_loss.item(),
         "g_grad_norm": g_grad_norm.item(),
