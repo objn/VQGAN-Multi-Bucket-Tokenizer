@@ -33,11 +33,11 @@ class VQGANTrainConfig:
     tile_size: int = 256
     patch_size: int = 8
     model_dim: int = 768
-    depth: int = 8
+    depth: int = 12
     num_heads: int = 12
     mlp_ratio: float = 4.0
     code_dim: int = 32            # factorized: lookup happens in this space, not model_dim
-    num_embeddings: int = 8192
+    num_embeddings: int = 16384
 
     # Measured on a 12GB RTX 3080 Ti, at tile_size 256 with LPIPS on. Peak
     # memory reserved by torch, before the ~1.5GB the desktop already holds:
@@ -58,14 +58,34 @@ class VQGANTrainConfig:
     # ~30, so it is nowhere near the bottleneck; 4 keeps a 6x margin while
     # holding ~3GB less host RAM in parquet buffers.
     num_workers: int = 4
-    crops_per_image: int = 2      # amortizes the JPEG decode
+    # Every image contributes its *whole* tile grid, so there is no crops-per-image
+    # cap; a big photo just yields more tiles. On ImageNet that averages ~4.9
+    # tiles per usable image at overlap 0 (median 4, max seen 100).
+    #
+    # 0 = tiles butt up against each other. Raise it to mirror what
+    # scripts/reconstruct.py does at inference (it defaults to 64px of
+    # cross-faded overlap), at the cost of more redundant training crops:
+    # overlap 64 yields ~7.2 tiles/image instead of ~4.9.
+    tile_overlap: int = 0
     shuffle_buffer: int = 1024
-    val_images: int = 512         # fixed center crops held in RAM for stable metrics
+    # Which corpus to draw from. "parquet" is the downloaded dataset with its
+    # own train/validation/test division (pretraining); "folder" is images/,
+    # split by the ratios given to build_index.py (finetuning). They are kept
+    # separate so pretraining never silently consumes the finetuning set.
+    source: str = "parquet"
+
+    # A time budget for the loss curve drawn *during* training, not a property
+    # of the validation set. The validation split is whatever the dataset says
+    # it is and is consumed whole by scripts/evaluate.py; at 50,000 ImageNet
+    # validation images (~257k tiles) one full pass takes ~2.5 hours at this
+    # model size, against ~11 minutes of training between evals, so the
+    # in-training readout walks a deterministic prefix instead.
+    eval_batches: int = 64
 
     # Schedule is in optimizer steps, not epochs: one pass over ImageNet-1k is
     # ~80k steps at this batch size, so "epoch" is too coarse a unit to
     # checkpoint, evaluate or warm up on.
-    max_steps: int = 200_000
+    max_steps: int = 1_000_000
     # 0 = EMA codebook updates from the very first step. The old pipeline warmed
     # up with gradient-based updates first, on the theory that EMA from step 0
     # locks in a noisy encoder — but measured over 1500 steps that warmup is
@@ -76,11 +96,11 @@ class VQGANTrainConfig:
     # warmup off, val L1 at step 250 already beat what the warmed-up run reached
     # at step 1500 (0.238 vs 0.233 at 6x the steps) and codebook usage ended
     # higher (61% vs 52%). Set this above 0 to get the old behavior back.
-    ema_warmup_steps: int = 0
+    ema_warmup_steps: int = 2_000
     disc_warmup_steps: int = 10_000   # steps before adversarial loss contributes to g_loss
     eval_every_steps: int = 2_000
-    checkpoint_every_steps: int = 5_000
-    log_every: int = 50
+    checkpoint_every_steps: int = 10_000
+    log_every: int = 2_000
 
     lr: float = 1e-4
     min_lr: float = 1e-6
@@ -88,14 +108,28 @@ class VQGANTrainConfig:
     # ViT-VQGAN loss weights.
     l2_weight: float = 1.0
     logit_laplace_weight: float = 0.1
-    lpips_weight: float = 0.1
-    disc_weight: float = 0.1
+    lpips_weight: float = 1.0
+    # Final scalar on top of the *adaptive* discriminator weight (Esser et
+    # al.'s ||grad nll|| / ||grad gan|| ratio at the decoder's last layer —
+    # see train_step.adaptive_disc_weight), not a fixed contribution to
+    # g_loss by itself.
+    #
+    # This started at 0.1, the figure in ViT-VQGAN's loss table — but that
+    # table is for a *fixed* GAN weight, and the adaptive ratio already
+    # normalizes the adversarial gradient against the reconstruction one, so
+    # 0.1 discounted it a second time. A 44k-step run measured lambda ~0.03,
+    # making the adversarial term's effective weight ~0.003: it had
+    # essentially no say, and reconstructions stayed blocky at the 8x8 patch
+    # boundaries the adversarial term is what teaches the decoder to smooth
+    # over. Esser et al., whose ratio this is, use 0.75-0.8 for the same
+    # scalar; 1.0 here is at the top of that range.
+    disc_weight: float = 1.0
     use_lpips: bool = True
 
     amp: bool = True            # autocast + train in bf16 (no GradScaler needed for bf16)
     grad_clip_norm: float = 1.0
 
-    seed: int = 0
+    seed: int = 24
 
     def model_config(self) -> dict:
         """The subset of this config that defines the network's shape.

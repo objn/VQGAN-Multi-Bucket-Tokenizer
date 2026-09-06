@@ -17,7 +17,9 @@ from torchvision.utils import make_grid, save_image
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from vqgan.config import DataConfig, VQGANTrainConfig
-from vqgan.data import build_shards, build_val_batch
+from torch.utils.data import DataLoader
+
+from vqgan.data import CropDataset, build_shards
 from vqgan.display import console, tqdm
 from vqgan.eval import compute_statistics, extract_features, fid_from_stats, get_feature_extractor
 from vqgan.models import VQGAN
@@ -31,7 +33,14 @@ def parse_args(argv=None):
     parser.add_argument(
         "--vqgan-checkpoint", default=str(Path(train_defaults.checkpoint_dir) / "vqgan_last.pt")
     )
-    parser.add_argument("--num-images", type=int, default=2048, help="validation crops to score")
+    parser.add_argument(
+        "--split", default="validation", choices=("validation", "test"),
+        help="which split to score, in full",
+    )
+    parser.add_argument(
+        "--source", default=train_defaults.source, choices=("parquet", "folder", "all"),
+        help="parquet = the downloaded dataset's own split; folder = images/",
+    )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--out", dest="out_dir", default="outputs/eval")
     return parser.parse_args(argv)
@@ -58,26 +67,40 @@ def main(argv=None):
 
     with open(args.index_path, encoding="utf-8") as f:
         index = json.load(f)
-    val_images = build_val_batch(
-        build_shards(index, "validation"),
+    train_defaults = VQGANTrainConfig()
+    shards = build_shards(index, args.split, args.source)
+    if not shards:
+        raise RuntimeError(f"no {args.split} shards for source={args.source!r} in {args.index_path}")
+    # The whole split, tiled exactly as training tiles it. No cap: the split is
+    # however many tiles its images hold.
+    eval_ds = CropDataset(
+        shards,
         tile_size=model_config["image_size"],
-        num_images=args.num_images,
+        tile_overlap=train_defaults.tile_overlap,
+        shuffle=False,
+        augment=False,
     )
-    console.print(f"scoring {val_images.shape[0]} validation crops")
+    eval_loader = DataLoader(
+        eval_ds, batch_size=args.batch_size, num_workers=train_defaults.num_workers, pin_memory=True
+    )
+    console.print(f"scoring the full {args.split} split ({len(shards)} shard(s)) from {args.source}")
 
     feature_extractor = get_feature_extractor(device)
     vqgan.quantizer.reset_usage_stats()
 
     real_feats, recon_feats = [], []
     first_batch = None
+    n_crops = 0
     with torch.no_grad():
-        for i in tqdm(range(0, val_images.shape[0], args.batch_size), desc="evaluating"):
-            images = val_images[i:i + args.batch_size].to(device)
+        for images in tqdm(eval_loader, desc="evaluating"):
+            images = images.to(device)
             recon = vqgan(images).recon
             if first_batch is None:
                 first_batch = (images[:8].cpu(), recon[:8].cpu())
             real_feats.append(extract_features(feature_extractor, images))
             recon_feats.append(extract_features(feature_extractor, recon))
+            n_crops += images.shape[0]
+    console.print(f"scored {n_crops:,} crops")
 
     real_feats = np.concatenate(real_feats, axis=0)
     recon_feats = np.concatenate(recon_feats, axis=0)

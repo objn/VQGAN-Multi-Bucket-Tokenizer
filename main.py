@@ -50,20 +50,34 @@ def latest_step_checkpoint(checkpoint_dir) -> str:
 
 
 def run_build_index():
+    """Index both corpora. The only real decision here is how to split the
+    user's own images — the two source directories and the index path are
+    fixed parts of the project layout, and asking for them would just invite
+    setting one here and forgetting to match it in Train."""
     defaults = DataConfig()
-    folder_root = ask("Your own images dir", defaults.folder_root)
-    manifest_dir = ask("Parquet manifest dir", defaults.manifest_dir)
-    out = ask("Index output", defaults.index_path)
-    build_index.main(["--folder-root", folder_root, "--manifest-dir", manifest_dir, "--out", out])
+    console.print(f"[dim]reading {defaults.manifest_dir}/ (dataset's own splits) "
+                  f"and {defaults.folder_root}/[/dim]")
+    console.print(f"[dim]the ratios below split {defaults.folder_root}/ only[/dim]")
+    val_frac = ask("validation fraction", defaults.val_frac)
+    test_frac = ask("test fraction", defaults.test_frac)
+    build_index.main(["--val-frac", val_frac, "--test-frac", test_frac])
 
 
-def run_train_vqgan():
+def _run_training(source: str, *, lr_default, require_checkpoint: bool):
     defaults = VQGANTrainConfig()
-    index_path = ask("Data index", defaults.index_path)
+    # No prompt for the index path: it is a fixed project location, and typing
+    # a different one here without matching it in Build data index would
+    # silently train on a stale index.
     max_steps = ask("Max steps", defaults.max_steps)
     batch_size = ask("Batch size", defaults.batch_size)
+    lr = ask("Learning rate", lr_default)
 
     resume_default = latest_step_checkpoint(defaults.checkpoint_dir)
+    if require_checkpoint and not resume_default:
+        raise RuntimeError(
+            "finetuning needs a pretrained checkpoint, and no vqgan_step*.pt was found in "
+            f"{defaults.checkpoint_dir} — pretrain with 'Train' first"
+        )
     if resume_default:
         # ask() returns the bracketed default on blank input (same as every
         # other prompt here), so once a checkpoint is found, blank means
@@ -74,10 +88,25 @@ def run_train_vqgan():
     else:
         resume = ask("Resume from checkpoint (blank = train from scratch)", defaults.resume)
 
-    argv = ["--index-path", index_path, "--max-steps", max_steps, "--batch-size", batch_size]
+    argv = [
+        "--source", source,
+        "--max-steps", max_steps, "--batch-size", batch_size, "--lr", lr,
+    ]
     if resume:
         argv += ["--resume", resume]
     train_vqgan.main(argv)
+
+
+def run_train_vqgan():
+    """Pretrain on the downloaded dataset, using its own train/val/test split."""
+    console.print("[dim]source: images-parquet — splits come from the dataset itself[/dim]")
+    _run_training("parquet", lr_default=VQGANTrainConfig().lr, require_checkpoint=False)
+
+
+def run_finetune_vqgan():
+    """Continue training on the user's own images/ split."""
+    console.print("[dim]source: images/ — splits come from the ratios you set in 'Build data index'[/dim]")
+    _run_training("folder", lr_default=1e-5, require_checkpoint=True)
 
 
 def run_pack_result():
@@ -113,10 +142,15 @@ def run_pack_result():
 
 def run_evaluate():
     defaults = VQGANTrainConfig()
-    index_path = ask("Data index", DataConfig().index_path)
     default_checkpoint = str(Path(defaults.checkpoint_dir) / "vqgan_last.pt")
     vqgan_checkpoint = ask("VQGAN checkpoint", default_checkpoint)
-    evaluate.main(["--index-path", index_path, "--vqgan-checkpoint", vqgan_checkpoint])
+    source = ask("Source (parquet/folder/all)", defaults.source)
+    split = ask("Split (validation/test)", "validation")
+    console.print("[dim]the whole split is scored — this can take hours on ImageNet[/dim]")
+    evaluate.main([
+        "--vqgan-checkpoint", vqgan_checkpoint,
+        "--source", source, "--split", split,
+    ])
 
 
 def run_reconstruct():
@@ -143,11 +177,12 @@ def run_visualize_model():
 def main_menu():
     options = {
         "1": ("Build data index", run_build_index),
-        "2": ("Train ViT-VQGAN", run_train_vqgan),
-        "3": ("Pack Result", run_pack_result),
-        "4": ("Evaluate (FID, codebook usage)", run_evaluate),
-        "5": ("Reconstruct image (tile + stitch)", run_reconstruct),
-        "6": ("Visualize model (TensorBoard graph)", run_visualize_model),
+        "2": ("Train ViT-VQGAN (images-parquet)", run_train_vqgan),
+        "3": ("Finetune ViT-VQGAN (images/)", run_finetune_vqgan),
+        "4": ("Pack Result", run_pack_result),
+        "5": ("Evaluate (FID, codebook usage)", run_evaluate),
+        "6": ("Reconstruct image (tile + stitch)", run_reconstruct),
+        "7": ("Visualize model (TensorBoard graph)", run_visualize_model),
         "0": ("Exit", None),
     }
     while True:

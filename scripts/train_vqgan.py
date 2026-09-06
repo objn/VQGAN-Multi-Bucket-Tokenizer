@@ -7,6 +7,7 @@ Usage:
 
 import argparse
 import json
+import itertools
 import math
 import subprocess
 import sys
@@ -19,8 +20,9 @@ from torchvision.utils import make_grid, save_image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from vqgan.config import VQGANTrainConfig
-from vqgan.data import CropDataset, build_shards, build_val_batch
+from vqgan.config import DataConfig, VQGANTrainConfig
+from vqgan.data import CropDataset, build_shards
+from vqgan.data.sources import FolderShard, ParquetShard, count_parquet_rows
 from vqgan.display import console, tqdm
 from vqgan.models import VQGAN, PatchDiscriminator
 from vqgan.training import train_step
@@ -54,6 +56,19 @@ def infinite(loader):
         yield from loader
 
 
+def describe_shards(shards) -> str:
+    """Shard counts alone read as dataset size and mislead — 294 parquet files
+    hold 1.28M images. Row counts come from parquet footers, so this is free."""
+    parquet = [s.path for s in shards if isinstance(s, ParquetShard)]
+    folder = sum(len(s.paths) for s in shards if isinstance(s, FolderShard))
+    parts = []
+    if parquet:
+        parts.append(f"{len(parquet)} parquet shard(s) / {count_parquet_rows(parquet):,} images")
+    if folder:
+        parts.append(f"{folder:,} folder image(s)")
+    return ", ".join(parts)
+
+
 def load_index(path):
     index_path = Path(path)
     if not index_path.is_file():
@@ -75,9 +90,9 @@ def main(argv=None):
 
     index = load_index(cfg.index_path)
     train_ds = CropDataset(
-        build_shards(index, "train"),
+        build_shards(index, "train", cfg.source),
         tile_size=cfg.tile_size,
-        crops_per_image=cfg.crops_per_image,
+        tile_overlap=cfg.tile_overlap,
         shuffle_buffer=cfg.shuffle_buffer,
         augment=True,
         seed=cfg.seed,
@@ -86,14 +101,33 @@ def main(argv=None):
         train_ds, batch_size=cfg.batch_size, num_workers=cfg.num_workers,
         drop_last=True, pin_memory=True,
     )
-    console.print(f"train shards: {len(train_ds.shards)}")
 
-    console.print("building fixed validation batch...")
-    val_images = build_val_batch(
-        build_shards(index, "validation"), tile_size=cfg.tile_size, num_images=cfg.val_images
+    # Same tiling, same crop size — only shuffling and augmentation are off, so
+    # the nth validation crop is the same crop at every evaluation point.
+    val_ds = CropDataset(
+        build_shards(index, "validation", cfg.source),
+        tile_size=cfg.tile_size,
+        tile_overlap=cfg.tile_overlap,
+        shuffle=False,
+        augment=False,
     )
-    console.print(f"val crops: {val_images.shape[0]}")
-    fixed_val_images = val_images[:8].to(device)
+    val_loader = DataLoader(
+        val_ds, batch_size=cfg.batch_size, num_workers=min(2, cfg.num_workers), pin_memory=True,
+    )
+    if not train_ds.shards:
+        raise RuntimeError(f"no train shards for source={cfg.source!r} — check {cfg.index_path}")
+    if not val_ds.shards:
+        raise RuntimeError(f"no validation shards for source={cfg.source!r} — check {cfg.index_path}")
+
+    data_cfg = DataConfig()
+    where = {"parquet": data_cfg.manifest_dir, "folder": data_cfg.folder_root,
+             "all": f"{data_cfg.manifest_dir} + {data_cfg.folder_root}"}[cfg.source]
+    console.print(f"[bold]source[/bold] {cfg.source} ({where}/)")
+    for name, shards in (("train", train_ds.shards), ("validation", val_ds.shards)):
+        console.print(f"  {name:>10}: {describe_shards(shards)}")
+
+    # A stable handful of crops for the side-by-side recon PNG.
+    fixed_val_images = next(iter(val_loader))[:8].to(device)
 
     global_step = 0
     ema_switched = False
@@ -228,8 +262,8 @@ def main(argv=None):
             running, running_n = {}, 0
 
         if global_step % cfg.eval_every_steps == 0:
-            evaluate(vqgan, val_images, device, out_dir, global_step, fixed_val_images,
-                     tb_writer, cfg.batch_size)
+            evaluate(vqgan, val_loader, device, out_dir, global_step, fixed_val_images,
+                     tb_writer, cfg.eval_batches)
             vqgan.train()
 
         if global_step % cfg.checkpoint_every_steps == 0:
@@ -243,13 +277,19 @@ def main(argv=None):
 
 
 @torch.no_grad()
-def evaluate(vqgan, val_images, device, out_dir, step, fixed_val_images, tb_writer, batch_size):
+def evaluate(vqgan, val_loader, device, out_dir, step, fixed_val_images, tb_writer, eval_batches):
+    """Progress readout on a deterministic prefix of the validation split.
+
+    `eval_batches` bounds how long this takes, not what the validation set is —
+    scripts/evaluate.py walks the split in full. The prefix is the same crops
+    every time (val_loader does not shuffle), so the curve is comparable.
+    """
     vqgan.eval()
     vqgan.quantizer.reset_usage_stats()
 
     total_l1, n = 0.0, 0
-    for i in range(0, val_images.shape[0], batch_size):
-        images = val_images[i:i + batch_size].to(device)
+    for images in itertools.islice(val_loader, eval_batches):
+        images = images.to(device)
         recon = vqgan(images).recon
         total_l1 += (recon - images).abs().mean().item() * images.shape[0]
         n += images.shape[0]

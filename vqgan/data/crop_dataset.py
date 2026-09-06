@@ -21,6 +21,8 @@ import torch
 from torch.utils.data import IterableDataset, get_worker_info
 from torchvision.transforms import functional as TF
 
+from .tiling import plan_tiles
+
 
 def _to_tensor(crop) -> torch.Tensor:
     """PIL RGB crop -> CHW float tensor in [-1, 1]."""
@@ -49,9 +51,23 @@ def random_white_balance(
 class CropDataset(IterableDataset):
     """Yields [3, tile_size, tile_size] tensors in [-1, 1], forever-ish.
 
-    `crops_per_image` amortizes the JPEG decode, which is the real per-image
-    cost here: taking 2 crops out of one decoded image is nearly free compared
-    to decoding a second image for the second crop.
+    Every image is cut into the *complete* grid of tiles that `plan_tiles`
+    lays out — the same planner scripts/reconstruct.py uses to feed a
+    full-resolution photo through the model — so the crops the model trains
+    on are drawn from exactly the distribution it will be asked to encode at
+    inference, edge tiles and all. No cap on tiles per image: a large photo
+    simply contributes more of them.
+
+    An image that yields fewer than two tiles (only possible when it is
+    exactly tile_size on both sides) has nothing to enumerate, so it falls
+    back to a single in-bounds window instead.
+
+    The same class serves train, validation and test: a split is simply the
+    list of shards handed to it. Pass `shuffle=False, augment=False` for
+    val/test and the pass becomes fully deterministic — same crops, same
+    order, every time — which is what makes val L1 and FID comparable across
+    evaluation points. There is deliberately no "how many" knob: a split is
+    however many tiles its images contain.
     """
 
     def __init__(
@@ -59,14 +75,16 @@ class CropDataset(IterableDataset):
         shards,
         *,
         tile_size,
-        crops_per_image=2,
+        tile_overlap=0,
+        shuffle=True,
         shuffle_buffer=1024,
         augment=True,
         seed=0,
     ):
         self.shards = list(shards)
         self.tile_size = tile_size
-        self.crops_per_image = crops_per_image
+        self.tile_overlap = tile_overlap
+        self.shuffle = shuffle
         self.shuffle_buffer = shuffle_buffer
         self.augment = augment
         self.seed = seed
@@ -76,9 +94,17 @@ class CropDataset(IterableDataset):
         tile = self.tile_size
         if w < tile or h < tile:
             return  # too small to crop at native resolution, and we never upscale
-        for _ in range(self.crops_per_image):
-            left = rng.randint(0, w - tile)
-            top = rng.randint(0, h - tile)
+
+        origins = plan_tiles(h, w, tile, self.tile_overlap)
+        if len(origins) < 2:
+            # Nothing to enumerate. Training takes a random window; evaluation
+            # takes the center one, so the pass stays reproducible.
+            if self.shuffle:
+                origins = [(rng.randint(0, h - tile), rng.randint(0, w - tile))]
+            else:
+                origins = [((h - tile) // 2, (w - tile) // 2)]
+
+        for top, left in origins:
             crop = _to_tensor(image.crop((left, top, left + tile, top + tile)))
             if self.augment:
                 if rng.random() < 0.5:
@@ -97,8 +123,15 @@ class CropDataset(IterableDataset):
         rng = random.Random((torch.initial_seed() + self.seed) % (2**63))
 
         my_shards = self.shards[worker_id::num_workers]
-        rng.shuffle(my_shards)
+        if not self.shuffle:
+            # Deterministic pass: shards in index order, no reservoir, so the
+            # nth crop is always the same crop.
+            for shard in my_shards:
+                for image in shard.iter_images():
+                    yield from self._crops(image, rng)
+            return
 
+        rng.shuffle(my_shards)
         buffer = []
         for shard in my_shards:
             for image in shard.iter_images():
@@ -111,27 +144,3 @@ class CropDataset(IterableDataset):
                     yield crop
         rng.shuffle(buffer)
         yield from buffer
-
-
-def build_val_batch(shards, *, tile_size, num_images, seed=0) -> torch.Tensor:
-    """A fixed [N, 3, tile, tile] batch of center crops, held in RAM.
-
-    Validation has to be the *same* pixels every time for val L1 and FID to be
-    comparable across steps, and it is small enough (512 crops ~= 100MB) to
-    keep in memory rather than caching to disk — which also keeps the promise
-    that this pipeline never writes image data back out.
-    """
-    crops = []
-    for shard in shards:
-        for image in shard.iter_images():
-            w, h = image.size
-            if w < tile_size or h < tile_size:
-                continue
-            left = (w - tile_size) // 2
-            top = (h - tile_size) // 2
-            crops.append(_to_tensor(image.crop((left, top, left + tile_size, top + tile_size))))
-            if len(crops) >= num_images:
-                return torch.stack(crops)
-    if not crops:
-        raise RuntimeError("no validation images were large enough to crop")
-    return torch.stack(crops)

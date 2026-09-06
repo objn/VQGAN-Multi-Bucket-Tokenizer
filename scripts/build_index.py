@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from vqgan.config import DataConfig
 from vqgan.data.sources import (
     PARQUET_SPLITS,
+    count_parquet_rows,
     discover_images,
     is_valid_image,
     parquet_files_for,
@@ -54,7 +55,8 @@ def index_parquet(manifest_dir) -> dict:
         for split in PARQUET_SPLITS:
             files = parquet_files_for(manifest, split)
             index[split].extend(str(p) for p in files)
-            console.print(f"  {manifest['name']} / {split}: {len(files)} shards")
+            n_images = count_parquet_rows(files)
+            console.print(f"  {manifest['name']} / {split}: {len(files)} shard(s), {n_images:,} images")
     return index
 
 
@@ -101,8 +103,10 @@ def main(argv=None):
         json.dump(index, f, indent=2)
 
     for split in PARQUET_SPLITS:
+        n_parquet_images = count_parquet_rows(parquet[split])
         console.print(
-            f"{split:>10}: {len(parquet[split])} parquet shard(s), {len(folder[split])} folder image(s)"
+            f"{split:>10}: {len(parquet[split])} parquet shard(s) / {n_parquet_images:,} images"
+            f", {len(folder[split])} folder image(s)"
         )
     console.print(f"[green]wrote[/green] {index_path}")
 

@@ -58,6 +58,20 @@ def parquet_files_for(manifest: dict, split: str) -> list[Path]:
     return sorted(root.glob(f"{split}-*.parquet"))
 
 
+def count_parquet_rows(paths) -> int:
+    """Total row count across parquet files, from footer metadata only —
+    each file's row count is stored alongside its schema, so this touches no
+    image bytes and costs nothing close to reading the (156GB) dataset.
+
+    Shard *file* counts are a poor proxy for dataset size (ImageNet-1k's
+    294 train shards hold ~4,357 images each): this is what build_index.py
+    reports instead, so "294 shards" doesn't read as "294 images."
+    """
+    import pyarrow.parquet as pq  # lazy: keep the package importable without pyarrow
+
+    return sum(pq.ParquetFile(p).metadata.num_rows for p in paths)
+
+
 def discover_images(root) -> list[Path]:
     """Every image file under `root`, recursively, in a stable order."""
     root = Path(root)
@@ -112,16 +126,36 @@ class FolderShard:
                 continue
 
 
-def build_shards(index: dict, split: str, *, folder_chunk: int = 64) -> list:
+SOURCES = ("parquet", "folder", "all")
+
+
+def build_shards(index: dict, split: str, source: str = "all", *, folder_chunk: int = 64) -> list:
     """Turn one split of a `data/index.json` into a flat list of shards.
 
-    Folder images are grouped into chunks so that a run of them is a comparable
-    unit of work to a parquet shard, which keeps the round-robin split across
-    DataLoader workers roughly balanced.
-    """
-    shards = [ParquetShard(path=p) for p in index["parquet"].get(split, [])]
+    `source` picks which corpus the split is drawn from, and the two are kept
+    apart on purpose because their splits mean different things:
 
-    folder_paths = index["folder"].get(split, [])
-    for i in range(0, len(folder_paths), folder_chunk):
-        shards.append(FolderShard(paths=folder_paths[i:i + folder_chunk]))
+      - "parquet" is the downloaded dataset, which ships its own
+        train/validation/test division — pretraining uses it as-is.
+      - "folder" is whatever the user dropped in images/, split by the
+        val_frac/test_frac ratios they chose when building the index —
+        finetuning uses that.
+
+    Mixing them would silently pretrain on the user's finetuning data and
+    make the two sets of split semantics indistinguishable.
+
+    Folder images are grouped into chunks so that a run of them is a
+    comparable unit of work to a parquet shard, which keeps the round-robin
+    split across DataLoader workers roughly balanced.
+    """
+    if source not in SOURCES:
+        raise ValueError(f"source must be one of {SOURCES}, got {source!r}")
+
+    shards = []
+    if source in ("parquet", "all"):
+        shards += [ParquetShard(path=p) for p in index["parquet"].get(split, [])]
+    if source in ("folder", "all"):
+        folder_paths = index["folder"].get(split, [])
+        for i in range(0, len(folder_paths), folder_chunk):
+            shards.append(FolderShard(paths=folder_paths[i:i + folder_chunk]))
     return shards

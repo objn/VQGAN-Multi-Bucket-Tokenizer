@@ -67,3 +67,10 @@ class Decoder(nn.Module):
         mu, log_b = x.chunk(2, dim=1)
         recon = 2 * torch.sigmoid(mu) - 1             # [-1, 1], same range as the input
         return recon, mu, log_b
+
+    def last_layer(self) -> nn.Parameter:
+        """The final layer's weight, for the adaptive discriminator-weight
+        trick (see train_step.py) — the VQGAN/ViT-VQGAN papers balance the
+        reconstruction and adversarial losses by comparing how hard *this one
+        layer* is pushed by each, rather than fixing their ratio by hand."""
+        return self.to_pixels.weight
