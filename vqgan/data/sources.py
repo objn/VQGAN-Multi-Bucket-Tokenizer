@@ -80,18 +80,38 @@ def discover_images(root) -> list[Path]:
     return sorted(p for p in root.rglob("*") if p.suffix.lower() in IMAGE_EXTENSIONS)
 
 
-def is_valid_image(path) -> bool:
-    """Open + verify an image is not corrupt/truncated."""
+def verified_size(path):
+    """(width, height) of an image that opens cleanly, else None.
+
+    Reads the header only — `Image.open` is lazy and `verify()` checks the
+    file's integrity without decoding it — so this stays cheap enough to run
+    over every file in `images/` while building the index. `size` has to be
+    read *before* `verify()`, which leaves the image object unusable.
+    """
     try:
         with Image.open(path) as im:
+            size = im.size
             im.verify()
-        return True
+        return size
     except (UnidentifiedImageError, OSError, ValueError):
-        return False
+        return None
+
+
+def is_valid_image(path) -> bool:
+    """Open + verify an image is not corrupt/truncated."""
+    return verified_size(path) is not None
 
 
 @dataclass
 class ParquetShard:
+    """One parquet file, streamed row by row.
+
+    Unlike the folder source, images too small to crop cannot be filtered out
+    while building the index: parquet footers carry row counts and schemas, not
+    image dimensions, so learning a row's size means decoding its JPEG. They are
+    dropped by CropDataset at training time instead.
+    """
+
     path: str
     batch_size: int = 64
 

@@ -71,12 +71,13 @@ def main(argv=None):
     shards = build_shards(index, args.split, args.source)
     if not shards:
         raise RuntimeError(f"no {args.split} shards for source={args.source!r} in {args.index_path}")
-    # The whole split, tiled exactly as training tiles it. No cap: the split is
-    # however many tiles its images hold.
+    # The whole split, on the same grid training uses but without its jitter,
+    # so the pass repeats exactly. No cap: the split is however many tiles its
+    # images hold.
     eval_ds = CropDataset(
         shards,
         tile_size=model_config["image_size"],
-        tile_overlap=train_defaults.tile_overlap,
+        tile_overlap_ratio=train_defaults.tile_overlap_ratio,
         shuffle=False,
         augment=False,
     )

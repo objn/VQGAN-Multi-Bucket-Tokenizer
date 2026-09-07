@@ -1,10 +1,11 @@
 """Streaming crop dataset.
 
 Images are never resized. A training example is a `tile_size` x `tile_size`
-window cut out of a source image at its native resolution, which is the same
-thing `scripts/reconstruct.py` feeds the model at inference time — so what the
-model trains on and what it is later asked to encode are the same distribution
-of detail.
+window cut out of a source image at its native resolution, the same size
+`scripts/reconstruct.py` feeds the model at inference time — so what the model
+trains on and what it is later asked to encode are the same distribution of
+detail. Images smaller than a tile on either side are dropped rather than
+upscaled.
 
 This is an IterableDataset rather than a map-style one because the corpus is
 1.28M JPEGs living inside 336 parquet shards: there is no cheap random access
@@ -21,14 +22,14 @@ import torch
 from torch.utils.data import IterableDataset, get_worker_info
 from torchvision.transforms import functional as TF
 
-from .tiling import plan_tiles
+from .tiling import jittered_tile_origins
 
 
-def _to_tensor(crop) -> torch.Tensor:
-    """PIL RGB crop -> CHW float tensor in [-1, 1]."""
+def to_tensor(image) -> torch.Tensor:
+    """PIL RGB image or crop -> CHW float tensor in [-1, 1]."""
     # np.array, not np.asarray: PIL hands back a read-only view, and
     # torch.from_numpy on a non-writable buffer warns on every call.
-    array = np.array(crop, dtype=np.uint8)
+    array = np.array(image, dtype=np.uint8)
     return torch.from_numpy(array).permute(2, 0, 1).float() / 127.5 - 1.0
 
 
@@ -51,23 +52,20 @@ def random_white_balance(
 class CropDataset(IterableDataset):
     """Yields [3, tile_size, tile_size] tensors in [-1, 1], forever-ish.
 
-    Every image is cut into the *complete* grid of tiles that `plan_tiles`
-    lays out — the same planner scripts/reconstruct.py uses to feed a
-    full-resolution photo through the model — so the crops the model trains
-    on are drawn from exactly the distribution it will be asked to encode at
-    inference, edge tiles and all. No cap on tiles per image: a large photo
-    simply contributes more of them.
-
-    An image that yields fewer than two tiles (only possible when it is
-    exactly tile_size on both sides) has nothing to enumerate, so it falls
-    back to a single in-bounds window instead.
+    Every image is cut into the whole overlapping grid `jittered_tile_origins`
+    lays out, so there is no cap on tiles per image: a large photo simply
+    contributes more of them (an image only wide enough for one tile
+    contributes exactly one). The grid is nudged by a few pixels on every
+    pass, which means the same photo yields slightly different crops each
+    epoch instead of the identical ones forever — position becomes an
+    augmentation rather than a constant.
 
     The same class serves train, validation and test: a split is simply the
     list of shards handed to it. Pass `shuffle=False, augment=False` for
-    val/test and the pass becomes fully deterministic — same crops, same
-    order, every time — which is what makes val L1 and FID comparable across
-    evaluation points. There is deliberately no "how many" knob: a split is
-    however many tiles its images contain.
+    val/test and the pass becomes fully deterministic — the jitter turns off
+    with it, leaving a fixed centered grid — which is what makes val L1 and
+    FID comparable across evaluation points. There is deliberately no "how
+    many" knob: a split is however many tiles its images contain.
     """
 
     def __init__(
@@ -75,7 +73,7 @@ class CropDataset(IterableDataset):
         shards,
         *,
         tile_size,
-        tile_overlap=0,
+        tile_overlap_ratio=0.15,
         shuffle=True,
         shuffle_buffer=1024,
         augment=True,
@@ -83,7 +81,7 @@ class CropDataset(IterableDataset):
     ):
         self.shards = list(shards)
         self.tile_size = tile_size
-        self.tile_overlap = tile_overlap
+        self.tile_overlap_ratio = tile_overlap_ratio
         self.shuffle = shuffle
         self.shuffle_buffer = shuffle_buffer
         self.augment = augment
@@ -95,17 +93,14 @@ class CropDataset(IterableDataset):
         if w < tile or h < tile:
             return  # too small to crop at native resolution, and we never upscale
 
-        origins = plan_tiles(h, w, tile, self.tile_overlap)
-        if len(origins) < 2:
-            # Nothing to enumerate. Training takes a random window; evaluation
-            # takes the center one, so the pass stays reproducible.
-            if self.shuffle:
-                origins = [(rng.randint(0, h - tile), rng.randint(0, w - tile))]
-            else:
-                origins = [((h - tile) // 2, (w - tile) // 2)]
+        # Jitter rides along with shuffling: on a val/test pass both are off and
+        # the nth crop is always the same crop.
+        origins = jittered_tile_origins(
+            h, w, tile, self.tile_overlap_ratio, rng, jitter=self.shuffle
+        )
 
         for top, left in origins:
-            crop = _to_tensor(image.crop((left, top, left + tile, top + tile)))
+            crop = to_tensor(image.crop((left, top, left + tile, top + tile)))
             if self.augment:
                 if rng.random() < 0.5:
                     crop = TF.hflip(crop)

@@ -12,7 +12,15 @@ make that stitch invisible:
     (`feather_window`), so neighbouring tiles fade into each other instead of
     meeting at a hard line. Independently decoded tiles disagree slightly at
     their shared boundary; feathering turns that step into a gradient.
+
+Training cuts its tiles differently, with `jittered_tile_origins`: the same
+grid, but laid out with a fixed stride and randomly nudged each pass so a
+photo does not contribute the identical crops every epoch. Inference keeps
+`plan_tiles`, because a reconstruction has to cover every pixel and a jittered
+grid deliberately does not.
 """
+
+import random
 
 import torch
 
@@ -85,3 +93,71 @@ def plan_tiles(h: int, w: int, tile: int, overlap: int) -> list[tuple[int, int]]
     """(top, left) origins covering an h x w image, in row-major order."""
     stride = tile - overlap
     return [(t, l) for t in tile_origins(h, tile, stride) for l in tile_origins(w, tile, stride)]
+
+
+def _axis_origins(length: int, tile: int, stride: int, max_jitter: int, rng, jitter: bool) -> list[int]:
+    """Start offsets along one axis: a strided grid, centered, optionally jittered.
+
+    `n` is how many whole tiles fit at this stride. Two cases, and between them
+    they cover every image size the dataset accepts:
+
+      - n == 1 (`length` in [tile, tile + stride)): there is no grid to speak
+        of, so a training pass takes a *fully* random in-bounds window rather
+        than a nudged center one — for a 479px side that is +/-111px of freedom
+        instead of +/-19, which is the whole point of cropping a small image.
+        With `jitter` off it is the center window, so evaluation is repeatable.
+      - n > 1: tiles every `stride` pixels, with the leftover split evenly
+        between the two ends instead of piling up at the far edge. Nothing is
+        pulled back to touch the border the way `tile_origins` does: the outer
+        ~leftover/2 pixels of the image are simply never sampled, which costs
+        an edge band but avoids over-sampling one side of every photo.
+    """
+    if length < tile:
+        raise ValueError(f"length {length} is smaller than tile {tile}")
+
+    n = 1 + (length - tile) // stride
+    if n == 1:
+        return [rng.randint(0, length - tile) if jitter else (length - tile) // 2]
+
+    leftover = length - tile - (n - 1) * stride
+    start = leftover // 2
+    if jitter:
+        # Shift the whole row/column together, and pick the shift from a range
+        # that is already in bounds rather than clamping each tile afterwards:
+        # clamping would pull an edge tile toward its neighbour and quietly
+        # push their overlap past overlap_ratio.
+        start += rng.randint(-min(max_jitter, start), min(max_jitter, leftover - start))
+    return [start + k * stride for k in range(n)]
+
+
+def jittered_tile_origins(
+    h: int, w: int, tile: int, overlap_ratio: float, rng: random.Random, *, jitter: bool = True
+) -> list[tuple[int, int]]:
+    """(top, left) origins for training crops of an h x w image.
+
+    Tiles overlap by `overlap_ratio` of their size, and the grid is nudged by up
+    to half that overlap each time, so the crops move from pass to pass. The
+    nudge is drawn once per axis and shifts that whole row/column together,
+    which keeps the spacing between neighbours exactly `stride` — the overlap
+    budget is honoured no matter how the dice land. (Jittering every tile
+    independently instead lets two neighbours each step half an overlap *toward*
+    each other, doubling the overlap between them, which is the one thing the
+    ratio is supposed to bound.)
+
+    `max_jitter` is half the overlap. Deriving it from the stride instead —
+    `(stride - (tile - overlap_px)) // 2` — is always 0, since `stride` is
+    defined as `tile - overlap_px`.
+
+    Returns origins, not centers, to match `plan_tiles`, `stitch_tiles` and
+    PIL's `crop()`; a center is `origin + tile // 2`.
+    """
+    if not 0.0 <= overlap_ratio < 1.0:
+        raise ValueError(f"overlap_ratio must be in [0, 1), got {overlap_ratio}")
+
+    overlap_px = int(tile * overlap_ratio)
+    stride = tile - overlap_px
+    max_jitter = overlap_px // 2
+
+    tops = _axis_origins(h, tile, stride, max_jitter, rng, jitter)
+    lefts = _axis_origins(w, tile, stride, max_jitter, rng, jitter)
+    return [(t, l) for t in tops for l in lefts]

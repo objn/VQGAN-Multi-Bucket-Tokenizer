@@ -14,6 +14,13 @@ class DataConfig:
     folder_root: str = "images"            # drop your own images here
     index_path: str = "data/index.json"
 
+    # Images shorter than this on either side are left out of the index
+    # entirely: the model crops at native resolution and never upscales, so
+    # they have nothing to contribute. Keep it equal to
+    # VQGANTrainConfig.tile_size. Only enforceable on `folder_root` — see
+    # ParquetShard for why the parquet datasets are filtered at training time.
+    min_size: int = 256
+
     # Only applies to `folder_root`; the parquet datasets ship their own splits.
     val_frac: float = 0.05
     test_frac: float = 0.05
@@ -59,14 +66,25 @@ class VQGANTrainConfig:
     # holding ~3GB less host RAM in parquet buffers.
     num_workers: int = 4
     # Every image contributes its *whole* tile grid, so there is no crops-per-image
-    # cap; a big photo just yields more tiles. On ImageNet that averages ~4.9
-    # tiles per usable image at overlap 0 (median 4, max seen 100).
+    # cap; a big photo just yields more tiles. Given as a fraction of tile_size,
+    # so the grid keeps its shape if tile_size changes, and it sets two things at
+    # once: how much neighbouring training tiles overlap, and how far the grid is
+    # randomly nudged each pass (half the overlap — see jittered_tile_origins).
+    # 0 therefore means no overlap *and* no jitter: the same crops every epoch.
     #
-    # 0 = tiles butt up against each other. Raise it to mirror what
-    # scripts/reconstruct.py does at inference (it defaults to 64px of
-    # cross-faded overlap), at the cost of more redundant training crops:
-    # overlap 64 yields ~7.2 tiles/image instead of ~4.9.
-    tile_overlap: int = 0
+    # Measured over the first 4,000 images of ImageNet train shard 0 (3,607 of
+    # them big enough to crop; the other 9.8% are under 256px on a side and are
+    # dropped):
+    #
+    #   plan_tiles, overlap 0   ->  5.13 tiles/image (median 4)
+    #   jittered, ratio 0.15    ->  2.98 tiles/image (median 2)
+    #
+    # The drop is not lost coverage. plan_tiles pulled its last tile back to the
+    # image edge, which on the typical 500x375 photo added a whole extra row and
+    # column overlapping the previous ones by ~50% — the same pixels, cropped
+    # twice. The jittered grid drops those duplicates and recovers the variety a
+    # different way, by moving every tile a little on each pass.
+    tile_overlap_ratio: float = 0.15
     shuffle_buffer: int = 1024
     # Which corpus to draw from. "parquet" is the downloaded dataset with its
     # own train/validation/test division (pretraining); "folder" is images/,

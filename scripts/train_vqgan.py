@@ -92,7 +92,7 @@ def main(argv=None):
     train_ds = CropDataset(
         build_shards(index, "train", cfg.source),
         tile_size=cfg.tile_size,
-        tile_overlap=cfg.tile_overlap,
+        tile_overlap_ratio=cfg.tile_overlap_ratio,
         shuffle_buffer=cfg.shuffle_buffer,
         augment=True,
         seed=cfg.seed,
@@ -102,12 +102,13 @@ def main(argv=None):
         drop_last=True, pin_memory=True,
     )
 
-    # Same tiling, same crop size — only shuffling and augmentation are off, so
-    # the nth validation crop is the same crop at every evaluation point.
+    # Same crop size and the same grid, minus the per-pass jitter that rides
+    # along with `shuffle` — so the nth validation crop is the same crop at
+    # every evaluation point.
     val_ds = CropDataset(
         build_shards(index, "validation", cfg.source),
         tile_size=cfg.tile_size,
-        tile_overlap=cfg.tile_overlap,
+        tile_overlap_ratio=cfg.tile_overlap_ratio,
         shuffle=False,
         augment=False,
     )

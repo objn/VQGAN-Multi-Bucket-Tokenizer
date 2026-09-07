@@ -24,9 +24,9 @@ from vqgan.data.sources import (
     PARQUET_SPLITS,
     count_parquet_rows,
     discover_images,
-    is_valid_image,
     parquet_files_for,
     read_manifests,
+    verified_size,
 )
 from vqgan.display import console, tqdm
 
@@ -37,6 +37,10 @@ def parse_args(argv=None) -> DataConfig:
     parser.add_argument("--manifest-dir", default=defaults.manifest_dir)
     parser.add_argument("--folder-root", default=defaults.folder_root)
     parser.add_argument("--out", dest="index_path", default=defaults.index_path)
+    parser.add_argument(
+        "--min-size", type=int, default=defaults.min_size,
+        help="drop images shorter than this on either side (default: the tile size)",
+    )
     parser.add_argument("--val-frac", type=float, default=defaults.val_frac)
     parser.add_argument("--test-frac", type=float, default=defaults.test_frac)
     parser.add_argument("--seed", type=int, default=defaults.seed)
@@ -66,12 +70,25 @@ def index_folder(cfg: DataConfig) -> dict:
         console.print(f"[yellow]no images under {cfg.folder_root}[/yellow]")
         return {split: [] for split in PARQUET_SPLITS}
 
-    # Corrupt files would only surface as a skipped image mid-training; catching
-    # them here means the index is a list of things that actually open.
-    usable = [p for p in tqdm(paths, desc="verifying") if is_valid_image(p)]
-    n_bad = len(paths) - len(usable)
+    # Corrupt files and images too small to crop would each only surface as a
+    # skipped image mid-training; catching them here means the index is a list
+    # of things that actually get trained on, and the split counts below are
+    # honest.
+    usable, n_bad, n_small = [], 0, 0
+    for path in tqdm(paths, desc="verifying"):
+        size = verified_size(path)
+        if size is None:
+            n_bad += 1
+        elif min(size) < cfg.min_size:
+            n_small += 1
+        else:
+            usable.append(path)
     if n_bad:
         console.print(f"[yellow]skipped {n_bad} corrupt/unreadable file(s)[/yellow]")
+    if n_small:
+        console.print(f"[yellow]skipped {n_small} image(s) smaller than {cfg.min_size}px[/yellow]")
+    if not usable:
+        return {split: [] for split in PARQUET_SPLITS}
 
     rng = random.Random(cfg.seed)
     shuffled = list(usable)
