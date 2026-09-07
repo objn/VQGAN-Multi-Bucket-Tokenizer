@@ -24,8 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from vqgan.config import VQGANTrainConfig
 from vqgan.data.sources import IMAGE_EXTENSIONS
-from vqgan.data.tiling import plan_tiles, stitch_tiles
 from vqgan.display import console, tqdm
+from vqgan.eval import reconstruct_tiled
 from vqgan.models import VQGAN
 
 
@@ -61,26 +61,14 @@ def load_vqgan(checkpoint_path, device):
     return vqgan, ckpt["model_config"]
 
 
-@torch.no_grad()
 def reconstruct_image(vqgan, image, tile_size, overlap, device, batch_size):
     """PIL image -> [3, H, W] reconstruction in [-1, 1] at the original size."""
     pixels = np.array(image.convert("RGB"), dtype=np.uint8)
-    h, w = pixels.shape[:2]
-    if h < tile_size or w < tile_size:
-        raise ValueError(f"image is {w}x{h}, smaller than the {tile_size}px tile")
-
     source = torch.from_numpy(pixels).permute(2, 0, 1).float() / 127.5 - 1.0
-    origins = plan_tiles(h, w, tile_size, overlap)
-
-    recon_tiles = []
-    for i in tqdm(range(0, len(origins), batch_size), desc="tiles", leave=False):
-        chunk = origins[i:i + batch_size]
-        batch = torch.stack(
-            [source[:, top:top + tile_size, left:left + tile_size] for top, left in chunk]
-        ).to(device)
-        recon_tiles.append(vqgan(batch).recon.cpu())
-
-    return stitch_tiles(torch.cat(recon_tiles), origins, (h, w), overlap)
+    return reconstruct_tiled(
+        vqgan, source, tile_size, overlap, device, batch_size,
+        progress=lambda batches: tqdm(batches, desc="tiles", leave=False),
+    )
 
 
 def main(argv=None):

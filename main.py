@@ -20,7 +20,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scripts import build_index, evaluate, reconstruct, train_vqgan, visualize_model
+from scripts import (
+    build_index,
+    evaluate,
+    reconstruct,
+    test_whole_image,
+    train_vqgan,
+    visualize_model,
+)
 from vqgan.config import DataConfig, VQGANTrainConfig
 from vqgan.display import console
 
@@ -153,6 +160,25 @@ def run_evaluate():
     ])
 
 
+def run_test():
+    """Score the dataset's own test split the way the model is actually used:
+    whole images, tiled and reassembled. Source and split are fixed — a test
+    set that can be pointed somewhere else is not a test set."""
+    defaults = VQGANTrainConfig()
+    default_checkpoint = str(Path(defaults.checkpoint_dir) / "vqgan_last.pt")
+    vqgan_checkpoint = ask("VQGAN checkpoint", default_checkpoint)
+    console.print("[dim]source: images-parquet, test split — images are tiled, run in "
+                  "batches, stitched back, then scored at full size[/dim]")
+    max_images = ask("Images to score (0 = the whole split)", 2048)
+    overlap = ask("Tile overlap (px)", 64)
+    test_whole_image.main([
+        "--vqgan-checkpoint", vqgan_checkpoint,
+        "--source", "parquet", "--split", "test",
+        "--max-images", max_images,
+        "--overlap", overlap,
+    ])
+
+
 def run_reconstruct():
     defaults = VQGANTrainConfig()
     image = ask("Image file or directory", DataConfig().folder_root)
@@ -180,9 +206,10 @@ def main_menu():
         "2": ("Train ViT-VQGAN (images-parquet)", run_train_vqgan),
         "3": ("Finetune ViT-VQGAN (images/)", run_finetune_vqgan),
         "4": ("Pack Result", run_pack_result),
-        "5": ("Evaluate (FID, codebook usage)", run_evaluate),
-        "6": ("Reconstruct image (tile + stitch)", run_reconstruct),
-        "7": ("Visualize model (TensorBoard graph)", run_visualize_model),
+        "5": ("Evaluate crops (FID, codebook usage)", run_evaluate),
+        "6": ("Test whole images (tile + stitch + score)", run_test),
+        "7": ("Reconstruct image (tile + stitch)", run_reconstruct),
+        "8": ("Visualize model (TensorBoard graph)", run_visualize_model),
         "0": ("Exit", None),
     }
     while True:

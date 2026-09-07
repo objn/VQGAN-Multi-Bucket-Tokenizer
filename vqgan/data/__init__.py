@@ -14,9 +14,12 @@ from .tiling import (
     stitch_tiles,
     tile_origins,
 )
+from .whole_image import WholeImageDataset, collate_single
 
 __all__ = [
     "CropDataset",
+    "WholeImageDataset",
+    "collate_single",
     "build_shards",
     "discover_images",
     "is_valid_image",
