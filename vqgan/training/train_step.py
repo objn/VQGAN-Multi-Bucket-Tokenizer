@@ -44,8 +44,8 @@ def train_step(
     use_lpips,
     amp,
     grad_clip_norm,
-    global_step=0,
-    disc_start_step=0,
+    images_seen=0,
+    disc_start_images=0,
 ):
     """One generator step + one discriminator step.
 
@@ -60,11 +60,13 @@ def train_step(
     inward at the image edge rather than padded), so nothing needs masking
     out.
 
-    `global_step`/`disc_start_step` implement discriminator warmup: before
-    `disc_start_step`, the adversarial term is excluded from the generator
-    loss entirely (the adaptive-weight gradient calls are skipped too, since
-    there is nothing to balance yet), but the discriminator itself keeps
-    training every step so it isn't cold once warmup ends.
+    `images_seen`/`disc_start_images` implement discriminator warmup: until
+    `disc_start_images` images have gone through, the adversarial term is
+    excluded from the generator loss entirely (the adaptive-weight gradient
+    calls are skipped too, since there is nothing to balance yet), but the
+    discriminator itself keeps training every step so it isn't cold once
+    warmup ends. Counted in images rather than steps so the warmup covers the
+    same amount of data at any batch size.
 
     LPIPS is optional and toggled with `use_lpips`. If the `lpips` package
     isn't installed, it's silently skipped even if you asked for it.
@@ -79,7 +81,7 @@ def train_step(
     """
     device = real_images.device
     device_type = device.type
-    past_warmup = global_step >= disc_start_step
+    past_warmup = images_seen >= disc_start_images
     lpips_on = use_lpips and LPIPS_AVAILABLE
 
     # ---- Generator (encoder+quantizer+decoder) step ----

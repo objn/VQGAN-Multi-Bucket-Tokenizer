@@ -130,6 +130,22 @@ def _axis_origins(length: int, tile: int, stride: int, max_jitter: int, rng, jit
     return [start + k * stride for k in range(n)]
 
 
+def count_tiles(h: int, w: int, tile: int, overlap_ratio: float) -> int:
+    """How many crops `jittered_tile_origins` would place over an h x w image.
+
+    Jitter only moves where the tiles land, never how many of them there are,
+    so this is the same `n` arithmetic as `_axis_origins` without the RNG —
+    cheap enough to run over a whole dataset from image headers alone. 0 if
+    the image is smaller than `tile` on either side.
+    """
+    if h < tile or w < tile:
+        return 0
+    stride = tile - int(tile * overlap_ratio)
+    n_h = 1 + (h - tile) // stride
+    n_w = 1 + (w - tile) // stride
+    return n_h * n_w
+
+
 def jittered_tile_origins(
     h: int, w: int, tile: int, overlap_ratio: float, rng: random.Random, *, jitter: bool = True
 ) -> list[tuple[int, int]]:

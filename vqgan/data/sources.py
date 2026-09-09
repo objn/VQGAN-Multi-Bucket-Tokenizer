@@ -72,6 +72,94 @@ def count_parquet_rows(paths) -> int:
     return sum(pq.ParquetFile(p).metadata.num_rows for p in paths)
 
 
+def shard_total(shards) -> int:
+    """Image count across shards from cheap metadata only — parquet row
+    counts from footers, folder shards from their own path lists. No image
+    bytes touched, so this is safe to call just to size a progress bar."""
+    parquet_paths = [s.path for s in shards if isinstance(s, ParquetShard)]
+    total = count_parquet_rows(parquet_paths) if parquet_paths else 0
+    total += sum(len(s.paths) for s in shards if isinstance(s, FolderShard))
+    return total
+
+
+def iter_sizes(shard):
+    """(width, height) of every image in a shard, decoding headers only —
+    unlike iter_images(), never calls .convert(), which is what forces a
+    full JPEG decode. Same skip semantics as iter_images() (a corrupt/
+    unreadable record is silently skipped), so index positions here line up
+    with iter_images()'s and iter_selected()'s for the same shard."""
+    if isinstance(shard, ParquetShard):
+        import pyarrow.parquet as pq
+
+        parquet_file = pq.ParquetFile(shard.path)
+        for batch in parquet_file.iter_batches(batch_size=shard.batch_size, columns=["image"]):
+            for record in batch.column("image").to_pylist():
+                try:
+                    with Image.open(io.BytesIO(record["bytes"])) as im:
+                        yield im.size
+                except (UnidentifiedImageError, OSError, ValueError):
+                    continue
+    else:
+        for path in shard.paths:
+            try:
+                with Image.open(path) as im:
+                    yield im.size
+            except (UnidentifiedImageError, OSError, ValueError):
+                continue
+
+
+def iter_selected(shard, indices: set[int]):
+    """Yield (index, PIL RGB image) for the 0-based positions in `indices`,
+    in the same order iter_images()/iter_sizes() would visit them — `index`
+    counts only records that pass the same open-and-read-size check
+    iter_sizes() uses, in the same order, so a shard with a corrupt/
+    unreadable record in it still numbers identically under both functions
+    (neither counts that record; both silently skip it).
+
+    For a parquet shard there is no random row access (see ParquetShard's
+    docstring), so this still reads every row sequentially — but it only
+    pays the full Image.open(...).convert("RGB") decode cost for rows whose
+    index is in `indices`; everything else only pays iter_sizes()'s cheap
+    header-read cost. A folder shard's paths are already a plain indexable
+    list, so this opens exactly the wanted files (plus the same cheap
+    validity check, to keep its numbering consistent with iter_sizes() too)."""
+    if isinstance(shard, ParquetShard):
+        import pyarrow.parquet as pq
+
+        parquet_file = pq.ParquetFile(shard.path)
+        i = 0
+        for batch in parquet_file.iter_batches(batch_size=shard.batch_size, columns=["image"]):
+            for record in batch.column("image").to_pylist():
+                raw = record["bytes"]
+                try:
+                    with Image.open(io.BytesIO(raw)) as im:
+                        im.size
+                except (UnidentifiedImageError, OSError, ValueError):
+                    continue
+                if i in indices:
+                    try:
+                        with Image.open(io.BytesIO(raw)) as im:
+                            yield i, im.convert("RGB")
+                    except (UnidentifiedImageError, OSError, ValueError):
+                        pass
+                i += 1
+    else:
+        i = 0
+        for path in shard.paths:
+            try:
+                with Image.open(path) as im:
+                    im.size
+            except (UnidentifiedImageError, OSError, ValueError):
+                continue
+            if i in indices:
+                try:
+                    with Image.open(path) as im:
+                        yield i, im.convert("RGB")
+                except (UnidentifiedImageError, OSError, ValueError):
+                    pass
+            i += 1
+
+
 def discover_images(root) -> list[Path]:
     """Every image file under `root`, recursively, in a stable order."""
     root = Path(root)

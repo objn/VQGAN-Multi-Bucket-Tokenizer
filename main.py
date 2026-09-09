@@ -4,7 +4,7 @@
 
 Each menu item is a thin wrapper around the corresponding scripts/*.py CLI —
 for full control over every flag, call those scripts directly instead
-(e.g. `python scripts/train_vqgan.py --max-steps 200000 --batch-size 8`).
+(e.g. `python scripts/train_vqgan.py --max-steps 1600000 --batch-size 8`).
 
 Autoregressive Transformer generation is out of scope for now — this project
 is focused on getting ViT-VQGAN encode/decode reconstruction quality right first.
@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts import (
     build_index,
+    count_crops,
     evaluate,
     reconstruct,
     test_whole_image,
@@ -70,14 +71,32 @@ def run_build_index():
     build_index.main(["--val-frac", val_frac, "--test-frac", test_frac])
 
 
+def run_count_crops():
+    """How many tiles the current index yields — a read of data/index.json's
+    headers only, no training or model involved."""
+    defaults = VQGANTrainConfig()
+    source = ask("Source (parquet/folder/all)", defaults.source)
+    tile_size = ask("Tile size", defaults.tile_size)
+    overlap = ask("Tile overlap ratio", defaults.tile_overlap_ratio)
+    count_crops.main([
+        "--source", source,
+        "--tile-size", tile_size, "--tile-overlap-ratio", overlap,
+    ])
+
+
 def _run_training(source: str, *, lr_default, require_checkpoint: bool):
     defaults = VQGANTrainConfig()
     # No prompt for the index path: it is a fixed project location, and typing
     # a different one here without matching it in Build data index would
     # silently train on a stale index.
+    # Named in steps (at batch_size=1, so also just images — see
+    # VQGANTrainConfig's "Schedule" section) rather than images so it reads as
+    # "how long to train": that number is batch-invariant, so changing the
+    # batch below only changes how fast it gets there, not the answer.
     max_steps = ask("Max steps", defaults.max_steps)
     batch_size = ask("Batch size", defaults.batch_size)
-    lr = ask("Learning rate", lr_default)
+    lr = ask(f"Learning rate (at batch {defaults.reference_batch_size}, scaled from there)",
+             lr_default)
 
     resume_default = latest_step_checkpoint(defaults.checkpoint_dir)
     if require_checkpoint and not resume_default:
@@ -203,13 +222,14 @@ def run_visualize_model():
 def main_menu():
     options = {
         "1": ("Build data index", run_build_index),
-        "2": ("Train ViT-VQGAN (images-parquet)", run_train_vqgan),
-        "3": ("Finetune ViT-VQGAN (images/)", run_finetune_vqgan),
-        "4": ("Pack Result", run_pack_result),
-        "5": ("Evaluate crops (FID, codebook usage)", run_evaluate),
-        "6": ("Test whole images (tile + stitch + score)", run_test),
-        "7": ("Reconstruct image (tile + stitch)", run_reconstruct),
-        "8": ("Visualize model (TensorBoard graph)", run_visualize_model),
+        "2": ("Count crops (how many tiles the index yields)", run_count_crops),
+        "3": ("Train ViT-VQGAN (images-parquet)", run_train_vqgan),
+        "4": ("Finetune ViT-VQGAN (images/)", run_finetune_vqgan),
+        "5": ("Pack Result", run_pack_result),
+        "6": ("Evaluate crops (FID, codebook usage)", run_evaluate),
+        "7": ("Test whole images (tile + stitch + score)", run_test),
+        "8": ("Reconstruct image (tile + stitch)", run_reconstruct),
+        "9": ("Visualize model (TensorBoard graph)", run_visualize_model),
         "0": ("Exit", None),
     }
     while True:
