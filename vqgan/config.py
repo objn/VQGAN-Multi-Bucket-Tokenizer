@@ -168,6 +168,17 @@ class VQGANTrainConfig:
     # 2-crop images. Seeded with `seed` below, computed once at startup, so
     # the exact same crops are reused at every evaluation call in a run.
     eval_size_groups: int = 5
+    # "" = build the eval subset above fresh at startup (two header-only
+    # passes over the validation split, then decode the selection — see
+    # eval_images/eval_size_groups above). On ImageNet that scan takes real
+    # wall-clock time before the first training step, and it produces the
+    # exact same crops every time given the same source/tile_size/
+    # tile_overlap_ratio/eval_images/eval_size_groups/seed — so it only ever
+    # needs doing once. Point this at a cache written by
+    # scripts/prep_eval_data.py to load that decoded selection straight from
+    # disk instead. train_vqgan.py refuses a cache built from different
+    # settings rather than silently evaluating on the wrong subset.
+    eval_prep_file: str = ""
 
     # ---- Schedule, in steps at batch_size=1 ----
     #

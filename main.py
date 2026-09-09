@@ -24,6 +24,7 @@ from scripts import (
     build_index,
     count_crops,
     evaluate,
+    prep_eval_data,
     reconstruct,
     test_whole_image,
     train_vqgan,
@@ -84,6 +85,20 @@ def run_count_crops():
     ])
 
 
+def run_prep_eval_data():
+    """Cache the validation eval subset (see vqgan/data/eval_subset.py) to
+    disk once, so Train/Finetune can load it back instead of re-scanning the
+    whole validation split at every startup. Rebuild it whenever source,
+    tile_size, tile_overlap_ratio, eval_images, eval_size_groups, seed, or
+    the batch size you'll train at changes — train_vqgan.py refuses a
+    mismatched cache rather than silently evaluating on the wrong subset."""
+    defaults = VQGANTrainConfig()
+    source = ask("Source (parquet/folder/all)", defaults.source)
+    batch_size = ask("Batch size you'll train at (sets the eval-size floor)", defaults.batch_size)
+    out = ask("Output file", "data/eval_prep.pt")
+    prep_eval_data.main(["--source", source, "--batch-size", batch_size, "--out", out])
+
+
 def _run_training(source: str, *, lr_default, require_checkpoint: bool):
     defaults = VQGANTrainConfig()
     # No prompt for the index path: it is a fixed project location, and typing
@@ -114,12 +129,19 @@ def _run_training(source: str, *, lr_default, require_checkpoint: bool):
     else:
         resume = ask("Resume from checkpoint (blank = train from scratch)", defaults.resume)
 
+    use_prep = ask("Use a prep data file for the eval subset? (y/n)", "n")
+    eval_prep_file = ""
+    if use_prep.strip().lower().startswith("y"):
+        eval_prep_file = ask("Prep data file", defaults.eval_prep_file or "data/eval_prep.pt")
+
     argv = [
         "--source", source,
         "--max-steps", max_steps, "--batch-size", batch_size, "--lr", lr,
     ]
     if resume:
         argv += ["--resume", resume]
+    if eval_prep_file:
+        argv += ["--eval-prep-file", eval_prep_file]
     train_vqgan.main(argv)
 
 
@@ -223,13 +245,14 @@ def main_menu():
     options = {
         "1": ("Build data index", run_build_index),
         "2": ("Count crops (how many tiles the index yields)", run_count_crops),
-        "3": ("Train ViT-VQGAN (images-parquet)", run_train_vqgan),
-        "4": ("Finetune ViT-VQGAN (images/)", run_finetune_vqgan),
-        "5": ("Pack Result", run_pack_result),
-        "6": ("Evaluate crops (FID, codebook usage)", run_evaluate),
-        "7": ("Test whole images (tile + stitch + score)", run_test),
-        "8": ("Reconstruct image (tile + stitch)", run_reconstruct),
-        "9": ("Visualize model (TensorBoard graph)", run_visualize_model),
+        "3": ("Create prep data file (cache the eval subset)", run_prep_eval_data),
+        "4": ("Train ViT-VQGAN (images-parquet)", run_train_vqgan),
+        "5": ("Finetune ViT-VQGAN (images/)", run_finetune_vqgan),
+        "6": ("Pack Result", run_pack_result),
+        "7": ("Evaluate crops (FID, codebook usage)", run_evaluate),
+        "8": ("Test whole images (tile + stitch + score)", run_test),
+        "9": ("Reconstruct image (tile + stitch)", run_reconstruct),
+        "10": ("Visualize model (TensorBoard graph)", run_visualize_model),
         "0": ("Exit", None),
     }
     while True:

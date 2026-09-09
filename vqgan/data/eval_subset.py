@@ -37,6 +37,18 @@ class SelectedImage:
     take_crops: int      # <= num_crops; how many crops (raster order) are kept
 
 
+def eval_image_floor(base_eval_images: int, batch_size: int) -> int:
+    """The in-training eval readout's actual crop count: max(base_eval_images,
+    64 * batch_size) — see VQGANTrainConfig.eval_images.
+
+    Shared between scripts/train_vqgan.py (which applies it live) and
+    scripts/prep_eval_data.py (which needs to reproduce the exact same number
+    so a cache built ahead of time matches what a run would otherwise build
+    for itself).
+    """
+    return max(base_eval_images, 64 * batch_size)
+
+
 def compute_log_size_edges(shards, *, tile_size: int, num_groups: int) -> list[float]:
     """`num_groups` + 1 log-spaced breakpoints spanning the real observed
     shorter side of every croppable image in `shards` (header reads only).

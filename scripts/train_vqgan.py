@@ -32,6 +32,7 @@ from vqgan.data import CropDataset, build_shards
 from vqgan.data.eval_subset import (
     build_balanced_val_subset,
     compute_log_size_edges,
+    eval_image_floor,
     materialize_selected_crops,
 )
 from vqgan.data.sources import FolderShard, ParquetShard, count_parquet_rows
@@ -150,7 +151,7 @@ def main(argv=None):
     # batch can afford a longer, less noisy val prefix. Unlike everything else
     # here that makes the val curve comparable only against runs at the same
     # batch size — see VQGANTrainConfig.eval_images.
-    eval_images = max(cfg.eval_images, 64 * cfg.batch_size)
+    eval_images = eval_image_floor(cfg.eval_images, cfg.batch_size)
     train_ds = CropDataset(
         build_shards(index, "train", cfg.source),
         tile_size=cfg.tile_size,
@@ -189,26 +190,49 @@ def main(argv=None):
     # A fixed, size-balanced subset of the validation split for the eval
     # readout below — computed once here (header reads only), then decoded
     # once, so every evaluate() call for the rest of the run reuses the same
-    # crops instead of re-scanning the split. See VQGANTrainConfig.eval_images
-    # and eval_size_groups, and vqgan/data/eval_subset.py.
-    size_edges = compute_log_size_edges(
-        val_ds.shards, tile_size=cfg.tile_size, num_groups=cfg.eval_size_groups
-    )
-    eval_selection = build_balanced_val_subset(
-        val_ds.shards, tile_size=cfg.tile_size, tile_overlap_ratio=cfg.tile_overlap_ratio,
-        edges=size_edges, max_crops_target=eval_images, seed=cfg.seed,
-    )
-    eval_val_crops, eval_offsets = materialize_selected_crops(
-        val_ds.shards, eval_selection, tile_size=cfg.tile_size,
-        tile_overlap_ratio=cfg.tile_overlap_ratio,
-    )
-    floor_note = f" (above the {cfg.eval_images:,} floor, 64 x batch {cfg.batch_size})" \
-        if eval_images != cfg.eval_images else ""
-    console.print(
-        f"[bold]val readout[/bold] {eval_val_crops.shape[0]:,} size-balanced crops from "
-        f"{len(eval_selection):,} image(s) across {cfg.eval_size_groups} size group(s), "
-        f"seed {cfg.seed}{floor_note}"
-    )
+    # crops instead of re-scanning the split. See VQGANTrainConfig.eval_images,
+    # eval_size_groups, eval_prep_file, and vqgan/data/eval_subset.py.
+    eval_params = {
+        "source": cfg.source, "tile_size": cfg.tile_size,
+        "tile_overlap_ratio": cfg.tile_overlap_ratio,
+        "eval_images": eval_images, "eval_size_groups": cfg.eval_size_groups,
+        "seed": cfg.seed,
+    }
+    if cfg.eval_prep_file:
+        cache = torch.load(cfg.eval_prep_file, map_location="cpu")
+        mismatched = {k: (cache["params"].get(k), v) for k, v in eval_params.items()
+                      if cache["params"].get(k) != v}
+        if mismatched:
+            raise RuntimeError(
+                f"{cfg.eval_prep_file} was built with different settings than this run "
+                f"(cached, current): {mismatched} — rebuild it with 'Create prep data file' "
+                "so it matches, or clear eval_prep_file to build the subset fresh"
+            )
+        eval_val_crops, eval_offsets, eval_selection = \
+            cache["crops"], cache["offsets"], cache["selection"]
+        console.print(
+            f"[bold]val readout[/bold] {eval_val_crops.shape[0]:,} crops loaded from "
+            f"{cfg.eval_prep_file} (skipped the validation-split scan)"
+        )
+    else:
+        size_edges = compute_log_size_edges(
+            val_ds.shards, tile_size=cfg.tile_size, num_groups=cfg.eval_size_groups
+        )
+        eval_selection = build_balanced_val_subset(
+            val_ds.shards, tile_size=cfg.tile_size, tile_overlap_ratio=cfg.tile_overlap_ratio,
+            edges=size_edges, max_crops_target=eval_images, seed=cfg.seed,
+        )
+        eval_val_crops, eval_offsets = materialize_selected_crops(
+            val_ds.shards, eval_selection, tile_size=cfg.tile_size,
+            tile_overlap_ratio=cfg.tile_overlap_ratio,
+        )
+        floor_note = f" (above the {cfg.eval_images:,} floor, 64 x batch {cfg.batch_size})" \
+            if eval_images != cfg.eval_images else ""
+        console.print(
+            f"[bold]val readout[/bold] {eval_val_crops.shape[0]:,} size-balanced crops from "
+            f"{len(eval_selection):,} image(s) across {cfg.eval_size_groups} size group(s), "
+            f"seed {cfg.seed}{floor_note}"
+        )
 
     # One representative per size group for the recon-preview grid — the
     # first image the round-robin picked from each group, reusing its
