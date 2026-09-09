@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from vqgan.config import DataConfig, VQGANTrainConfig
 from vqgan.data import CropDataset, build_shards
 from vqgan.data.eval_subset import (
+    SelectedImage,
     build_balanced_val_subset,
     compute_log_size_edges,
     eval_image_floor,
@@ -208,8 +209,8 @@ def main(argv=None):
                 f"(cached, current): {mismatched} — rebuild it with 'Create prep data file' "
                 "so it matches, or clear eval_prep_file to build the subset fresh"
             )
-        eval_val_crops, eval_offsets, eval_selection = \
-            cache["crops"], cache["offsets"], cache["selection"]
+        eval_val_crops, eval_offsets = cache["crops"], cache["offsets"]
+        eval_selection = [SelectedImage(**d) for d in cache["selection"]]
         console.print(
             f"[bold]val readout[/bold] {eval_val_crops.shape[0]:,} crops loaded from "
             f"{cfg.eval_prep_file} (skipped the validation-split scan)"

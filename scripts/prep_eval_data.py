@@ -21,6 +21,7 @@ Usage:
 
 import argparse
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -83,7 +84,11 @@ def main(argv=None):
     torch.save({
         "crops": crops,
         "offsets": offsets,
-        "selection": selection,
+        # Plain dicts, not SelectedImage instances: torch.load defaults to
+        # weights_only=True since PyTorch 2.6, which refuses to unpickle a
+        # custom class. Sticking to tensors/lists/dicts/primitives keeps
+        # loading this cache safe under that default.
+        "selection": [asdict(s) for s in selection],
         "params": {
             "source": args.source, "tile_size": args.tile_size,
             "tile_overlap_ratio": args.tile_overlap_ratio,
