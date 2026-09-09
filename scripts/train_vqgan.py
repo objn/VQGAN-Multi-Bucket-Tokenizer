@@ -131,6 +131,10 @@ def main(argv=None):
     torch.manual_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp = cfg.amp and device.type == "cuda"
+    if device.type == "cuda":
+        print(f"Using GPU: {torch.cuda.get_device_name(device)}")
+    else:
+        print("No GPU found, using CPU")
 
     checkpoint_dir = Path(cfg.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
