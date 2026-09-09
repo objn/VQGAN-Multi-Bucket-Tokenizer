@@ -233,7 +233,7 @@ class VQGANTrainConfig:
     lr: float = 1e-4
     lr_scaling: str = "sqrt"
     min_lr: float = 1e-6
-    end_steps_lr: float = 1_000_000  # images at which lr decays to min_lr
+    end_steps_lr: float = 3_400_000  # images at which lr decays to min_lr
 
     # ViT-VQGAN loss weights.
     l2_weight: float = 1.0
@@ -253,7 +253,7 @@ class VQGANTrainConfig:
     # boundaries the adversarial term is what teaches the decoder to smooth
     # over. Esser et al., whose ratio this is, use 0.75-0.8 for the same
     # scalar; 1.0 here is at the top of that range.
-    disc_weight: float = 1.0
+    disc_weight: float = 1.25
     use_lpips: bool = True
 
     amp: bool = True            # autocast + train in bf16 (no GradScaler needed for bf16)
