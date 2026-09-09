@@ -1,15 +1,16 @@
-from .blocks import ResBlock
 from .decoder import Decoder
 from .discriminator import PatchDiscriminator
 from .encoder import Encoder
 from .quantizer import VectorQuantizer
-from .vqgan import VQGAN
+from .transformer import TransformerBlock
+from .vqgan import VQGAN, VQOutput
 
 __all__ = [
-    "ResBlock",
+    "TransformerBlock",
     "Encoder",
     "Decoder",
     "VectorQuantizer",
     "PatchDiscriminator",
     "VQGAN",
+    "VQOutput",
 ]

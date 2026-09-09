@@ -6,3 +6,5 @@ __pycache__/
 /data/
 /images/
 /outputs/
+/nottrain/
+/images-parquet/

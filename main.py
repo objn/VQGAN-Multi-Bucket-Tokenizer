@@ -1,13 +1,13 @@
-"""Interactive menu entrypoint for the VQGAN pipeline.
+"""Interactive menu entrypoint for the ViT-VQGAN pipeline.
 
     python main.py
 
 Each menu item is a thin wrapper around the corresponding scripts/*.py CLI —
 for full control over every flag, call those scripts directly instead
-(e.g. `python scripts/train_vqgan.py --epochs 100 --batch-size 14`).
+(e.g. `python scripts/train_vqgan.py --max-steps 1600000 --batch-size 8`).
 
 Autoregressive Transformer generation is out of scope for now — this project
-is focused on getting VQGAN encode/decode reconstruction quality right first.
+is focused on getting ViT-VQGAN encode/decode reconstruction quality right first.
 """
 
 import json
@@ -20,11 +20,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scripts import evaluate, preprocess, train_vqgan, visualize_model
-from vqgan.config import PreprocessConfig, VQGANTrainConfig
+from scripts import (
+    build_index,
+    count_crops,
+    evaluate,
+    reconstruct,
+    test_whole_image,
+    train_vqgan,
+    visualize_model,
+)
+from vqgan.config import DataConfig, VQGANTrainConfig
 from vqgan.display import console
 
-_EPOCH_CKPT_RE = re.compile(r"vqgan_epoch(\d+)\.pt")
+_STEP_CKPT_RE = re.compile(r"vqgan_step(\d+)\.pt")
 
 
 def ask(prompt: str, default) -> str:
@@ -32,16 +40,16 @@ def ask(prompt: str, default) -> str:
     return raw if raw else str(default)
 
 
-def latest_epoch_checkpoint(checkpoint_dir) -> str:
-    """Newest vqgan_epochXXXX.pt in checkpoint_dir by epoch number — never
+def latest_step_checkpoint(checkpoint_dir) -> str:
+    """Newest vqgan_stepNNNNNNN.pt in checkpoint_dir by step number — never
     vqgan_last.pt, which gets overwritten every run and isn't tied to a
-    specific epoch. Returns "" if none exist."""
+    specific step. Returns "" if none exist."""
     checkpoint_dir = Path(checkpoint_dir)
     if not checkpoint_dir.is_dir():
         return ""
     candidates = []
     for p in checkpoint_dir.iterdir():
-        m = _EPOCH_CKPT_RE.fullmatch(p.name)
+        m = _STEP_CKPT_RE.fullmatch(p.name)
         if m:
             candidates.append((int(m.group(1)), p))
     if not candidates:
@@ -49,40 +57,82 @@ def latest_epoch_checkpoint(checkpoint_dir) -> str:
     return str(max(candidates, key=lambda t: t[0])[1])
 
 
-def run_preprocess():
-    defaults = PreprocessConfig()
-    root = ask("Raw images root", defaults.root)
-    out = ask("Output dir", defaults.out_dir)
-    val_frac = ask("Validation fraction", defaults.val_frac)
-    preprocess.main(["--root", root, "--out", out, "--val-frac", val_frac])
+def run_build_index():
+    """Index both corpora. The only real decision here is how to split the
+    user's own images — the two source directories and the index path are
+    fixed parts of the project layout, and asking for them would just invite
+    setting one here and forgetting to match it in Train."""
+    defaults = DataConfig()
+    console.print(f"[dim]reading {defaults.manifest_dir}/ (dataset's own splits) "
+                  f"and {defaults.folder_root}/[/dim]")
+    console.print(f"[dim]the ratios below split {defaults.folder_root}/ only[/dim]")
+    val_frac = ask("validation fraction", defaults.val_frac)
+    test_frac = ask("test fraction", defaults.test_frac)
+    build_index.main(["--val-frac", val_frac, "--test-frac", test_frac])
 
 
-def run_train_vqgan():
+def run_count_crops():
+    """How many tiles the current index yields — a read of data/index.json's
+    headers only, no training or model involved."""
     defaults = VQGANTrainConfig()
-    data_dir = ask("Preprocessed data dir", defaults.data_dir)
-    epochs = ask("Epochs", defaults.epochs)
-    batch_size = ask("Batch size", defaults.batch_size)
+    source = ask("Source (parquet/folder/all)", defaults.source)
+    tile_size = ask("Tile size", defaults.tile_size)
+    overlap = ask("Tile overlap ratio", defaults.tile_overlap_ratio)
+    count_crops.main([
+        "--source", source,
+        "--tile-size", tile_size, "--tile-overlap-ratio", overlap,
+    ])
 
-    resume_default = latest_epoch_checkpoint(defaults.checkpoint_dir)
+
+def _run_training(source: str, *, lr_default, require_checkpoint: bool):
+    defaults = VQGANTrainConfig()
+    # No prompt for the index path: it is a fixed project location, and typing
+    # a different one here without matching it in Build data index would
+    # silently train on a stale index.
+    # Named in steps (at batch_size=1, so also just images — see
+    # VQGANTrainConfig's "Schedule" section) rather than images so it reads as
+    # "how long to train": that number is batch-invariant, so changing the
+    # batch below only changes how fast it gets there, not the answer.
+    max_steps = ask("Max steps", defaults.max_steps)
+    batch_size = ask("Batch size", defaults.batch_size)
+    lr = ask(f"Learning rate (at batch {defaults.reference_batch_size}, scaled from there)",
+             lr_default)
+
+    resume_default = latest_step_checkpoint(defaults.checkpoint_dir)
+    if require_checkpoint and not resume_default:
+        raise RuntimeError(
+            "finetuning needs a pretrained checkpoint, and no vqgan_step*.pt was found in "
+            f"{defaults.checkpoint_dir} — pretrain with 'Train' first"
+        )
     if resume_default:
         # ask() returns the bracketed default on blank input (same as every
-        # other prompt here), so once a checkpoint is found, blank now means
-        # "use it" — not "train from scratch" like the old hint text said.
-        # "scratch" is the explicit escape hatch for the from-scratch case.
+        # other prompt here), so once a checkpoint is found, blank means
+        # "use it". "scratch" is the explicit escape hatch.
         resume = ask("Resume from checkpoint (blank = use this, or type 'scratch')", resume_default)
         if resume.strip().lower() == "scratch":
             resume = ""
     else:
         resume = ask("Resume from checkpoint (blank = train from scratch)", defaults.resume)
 
-    argv = ["--data-dir", data_dir, "--epochs", epochs, "--batch-size", batch_size]
+    argv = [
+        "--source", source,
+        "--max-steps", max_steps, "--batch-size", batch_size, "--lr", lr,
+    ]
     if resume:
         argv += ["--resume", resume]
     train_vqgan.main(argv)
 
 
+def run_train_vqgan():
+    """Pretrain on the downloaded dataset, using its own train/val/test split."""
+    console.print("[dim]source: images-parquet — splits come from the dataset itself[/dim]")
+    _run_training("parquet", lr_default=VQGANTrainConfig().lr, require_checkpoint=False)
+
+
 def run_finetune_vqgan():
-    console.print("[yellow]FineTune VQGAN: not implemented yet[/yellow]")
+    """Continue training on the user's own images/ split."""
+    console.print("[dim]source: images/ — splits come from the ratios you set in 'Build data index'[/dim]")
+    _run_training("folder", lr_default=1e-5, require_checkpoint=True)
 
 
 def run_pack_result():
@@ -99,51 +149,91 @@ def run_pack_result():
         json.dump(asdict(defaults), f, indent=2)
     console.print(f"[green]wrote[/green] {config_path}")
 
-    recon_files = sorted(out_dir.glob("recon_epoch*.png")) if out_dir.is_dir() else []
+    recon_files = sorted(out_dir.glob("recon_step*.png")) if out_dir.is_dir() else []
     for p in recon_files:
         shutil.move(str(p), str(result_dir / p.name))
     if recon_files:
         console.print(f"[green]moved[/green] {len(recon_files)} recon image(s) to {result_dir}")
     else:
-        console.print("[yellow]no recon_epoch*.png files found[/yellow]")
+        console.print("[yellow]no recon_step*.png files found[/yellow]")
 
-    latest_ckpt = latest_epoch_checkpoint(checkpoint_dir)
+    latest_ckpt = latest_step_checkpoint(checkpoint_dir)
     if latest_ckpt:
         latest_ckpt = Path(latest_ckpt)
         shutil.move(str(latest_ckpt), str(result_dir / latest_ckpt.name))
         console.print(f"[green]moved[/green] {latest_ckpt.name} to {result_dir}")
     else:
-        console.print("[yellow]no vqgan_epoch*.pt checkpoint found (vqgan_last.pt is left alone)[/yellow]")
+        console.print("[yellow]no vqgan_step*.pt checkpoint found (vqgan_last.pt is left alone)[/yellow]")
 
 
 def run_evaluate():
     defaults = VQGANTrainConfig()
-    data_dir = ask("Preprocessed data dir", defaults.data_dir)
     default_checkpoint = str(Path(defaults.checkpoint_dir) / "vqgan_last.pt")
     vqgan_checkpoint = ask("VQGAN checkpoint", default_checkpoint)
-    evaluate.main(["--data-dir", data_dir, "--vqgan-checkpoint", vqgan_checkpoint])
+    source = ask("Source (parquet/folder/all)", defaults.source)
+    split = ask("Split (validation/test)", "validation")
+    console.print("[dim]the whole split is scored — this can take hours on ImageNet[/dim]")
+    evaluate.main([
+        "--vqgan-checkpoint", vqgan_checkpoint,
+        "--source", source, "--split", split,
+    ])
+
+
+def run_test():
+    """Score the dataset's own test split the way the model is actually used:
+    whole images, tiled and reassembled. Source and split are fixed — a test
+    set that can be pointed somewhere else is not a test set."""
+    defaults = VQGANTrainConfig()
+    default_checkpoint = str(Path(defaults.checkpoint_dir) / "vqgan_last.pt")
+    vqgan_checkpoint = ask("VQGAN checkpoint", default_checkpoint)
+    console.print("[dim]source: images-parquet, test split — images are tiled, run in "
+                  "batches, stitched back, then scored at full size[/dim]")
+    max_images = ask("Images to score (0 = the whole split)", 2048)
+    overlap = ask("Tile overlap (px)", 64)
+    test_whole_image.main([
+        "--vqgan-checkpoint", vqgan_checkpoint,
+        "--source", "parquet", "--split", "test",
+        "--max-images", max_images,
+        "--overlap", overlap,
+    ])
+
+
+def run_reconstruct():
+    defaults = VQGANTrainConfig()
+    image = ask("Image file or directory", DataConfig().folder_root)
+    default_checkpoint = str(Path(defaults.checkpoint_dir) / "vqgan_last.pt")
+    vqgan_checkpoint = ask("VQGAN checkpoint", default_checkpoint)
+    overlap = ask("Tile overlap (px)", 64)
+    reconstruct.main([
+        "--image", image,
+        "--vqgan-checkpoint", vqgan_checkpoint,
+        "--overlap", overlap,
+        "--side-by-side",
+    ])
 
 
 def run_visualize_model():
     defaults = VQGANTrainConfig()
     default_checkpoint = str(Path(defaults.checkpoint_dir) / "vqgan_last.pt")
     vqgan_checkpoint = ask("VQGAN checkpoint", default_checkpoint)
-    canvas_size = ask("Canvas size (dummy input for tracing)", PreprocessConfig().canvas_size)
-    visualize_model.main(["--vqgan-checkpoint", vqgan_checkpoint, "--canvas-size", canvas_size])
+    visualize_model.main(["--vqgan-checkpoint", vqgan_checkpoint])
 
 
 def main_menu():
     options = {
-        "1": ("Preprocess data", run_preprocess),
-        "2": ("Train VQGAN", run_train_vqgan),
-        "3": ("FineTune VQGAN", run_finetune_vqgan),
-        "4": ("Pack Result", run_pack_result),
-        "5": ("Evaluate (FID, codebook usage)", run_evaluate),
-        "6": ("Visualize model (TensorBoard graph)", run_visualize_model),
+        "1": ("Build data index", run_build_index),
+        "2": ("Count crops (how many tiles the index yields)", run_count_crops),
+        "3": ("Train ViT-VQGAN (images-parquet)", run_train_vqgan),
+        "4": ("Finetune ViT-VQGAN (images/)", run_finetune_vqgan),
+        "5": ("Pack Result", run_pack_result),
+        "6": ("Evaluate crops (FID, codebook usage)", run_evaluate),
+        "7": ("Test whole images (tile + stitch + score)", run_test),
+        "8": ("Reconstruct image (tile + stitch)", run_reconstruct),
+        "9": ("Visualize model (TensorBoard graph)", run_visualize_model),
         "0": ("Exit", None),
     }
     while True:
-        console.print("\n[bold]=== VQGAN pipeline ===[/bold]")
+        console.print("\n[bold]=== ViT-VQGAN pipeline ===[/bold]")
         for key, (label, _) in options.items():
             console.print(f"  {key}) {label}")
         choice = input("> ").strip()
