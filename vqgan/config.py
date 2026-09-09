@@ -185,7 +185,7 @@ class VQGANTrainConfig:
     #
     # Epochs are still too coarse a unit to schedule on: one pass over
     # ImageNet-1k is ~3.8M crops at the current tiling.
-    max_steps: int = 11_000_000
+    max_steps: int = 3_400_000
     # 0 = EMA codebook updates from the very first step. The old pipeline warmed
     # up with gradient-based updates first, on the theory that EMA from step 0
     # locks in a noisy encoder — but measured over 1500 steps that warmup is
@@ -197,12 +197,12 @@ class VQGANTrainConfig:
     # at step 1500 (0.238 vs 0.233 at 6x the steps) and codebook usage ended
     # higher (61% vs 52%). Set this above 0 to get the old behavior back.
     ema_warmup_steps: int = 10_000
-    disc_warmup_steps: int = 100_000   # images before adversarial loss contributes to g_loss
+    disc_warmup_steps: int = 20_000   # images before adversarial loss contributes to g_loss
     # 0 = no LR warmup, cosine decay starts at base_lr on image 0 (the old
     # behavior). Above 0, lr ramps linearly from 0 up to base_lr over this
     # many images, then the cosine decay in cosine_lr() takes over from
     # base_lr down to min_lr over the images remaining until max_steps.
-    lr_warmup_steps: int = 100_000
+    lr_warmup_steps: int = 10_000
     eval_every_steps: int = 10_000
     checkpoint_every_steps: int = 100_000
     log_every_steps: int = 10_000
