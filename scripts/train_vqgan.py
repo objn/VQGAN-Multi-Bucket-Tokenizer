@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 
 import torch
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import make_grid, save_image
@@ -39,7 +40,7 @@ from vqgan.data.eval_subset import (
 from vqgan.data.sources import FolderShard, ParquetShard, count_parquet_rows
 from vqgan.display import console, tqdm
 from vqgan.models import VQGAN, PatchDiscriminator
-from vqgan.training import train_step
+from vqgan.training import cleanup_distributed, setup_distributed, train_step, unwrap
 
 
 def cosine_lr(
@@ -131,10 +132,19 @@ def load_index(path):
 def main(argv=None):
     cfg, reset_discriminator = parse_args(argv)
     torch.manual_seed(cfg.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # (False, 0, 0, 1) unless torchrun launched this, in which case every
+    # count below that multiplies by world_size degenerates to what a single
+    # process computed before DDP existed. See vqgan/training/distributed.py.
+    is_distributed, rank, local_rank, world_size = setup_distributed()
+    is_main = rank == 0
+    if is_distributed:
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp = cfg.amp and device.type == "cuda"
     if device.type == "cuda":
-        print(f"Using GPU: {torch.cuda.get_device_name(device)}")
+        where = f"rank {rank}/{world_size} on " if is_distributed else ""
+        print(f"Using GPU: {where}{torch.cuda.get_device_name(device)}")
     else:
         print("No GPU found, using CPU")
 
@@ -151,8 +161,11 @@ def main(argv=None):
     # The in-training readout scales with the machine: a card that fits a big
     # batch can afford a longer, less noisy val prefix. Unlike everything else
     # here that makes the val curve comparable only against runs at the same
-    # batch size — see VQGANTrainConfig.eval_images.
-    eval_images = eval_image_floor(cfg.eval_images, cfg.batch_size)
+    # batch size — see VQGANTrainConfig.eval_images. batch_size * world_size is
+    # the global batch (what the user asked for; each rank got a share of it),
+    # which is the number that rationale is about.
+    global_batch = cfg.batch_size * world_size
+    eval_images = eval_image_floor(cfg.eval_images, global_batch)
     train_ds = CropDataset(
         build_shards(index, "train", cfg.source),
         tile_size=cfg.tile_size,
@@ -160,6 +173,11 @@ def main(argv=None):
         shuffle_buffer=shuffle_buffer,
         augment=True,
         seed=cfg.seed,
+        # Only the train stream is split across processes. val_ds below is
+        # never iterated as a DataLoader — eval_subset.py reads its shard list
+        # directly — and only rank 0 evaluates anyway.
+        rank=rank,
+        world_size=world_size,
     )
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, num_workers=cfg.num_workers,
@@ -184,69 +202,75 @@ def main(argv=None):
     data_cfg = DataConfig()
     where = {"parquet": data_cfg.manifest_dir, "folder": data_cfg.folder_root,
              "all": f"{data_cfg.manifest_dir} + {data_cfg.folder_root}"}[cfg.source]
-    console.print(f"[bold]source[/bold] {cfg.source} ({where}/)")
-    for name, shards in (("train", train_ds.shards), ("validation", val_ds.shards)):
-        console.print(f"  {name:>10}: {describe_shards(shards)}")
+    if is_main:
+        console.print(f"[bold]source[/bold] {cfg.source} ({where}/)")
+        for name, shards in (("train", train_ds.shards), ("validation", val_ds.shards)):
+            console.print(f"  {name:>10}: {describe_shards(shards)}")
 
     # A fixed, size-balanced subset of the validation split for the eval
     # readout below — computed once here (header reads only), then decoded
     # once, so every evaluate() call for the rest of the run reuses the same
     # crops instead of re-scanning the split. See VQGANTrainConfig.eval_images,
     # eval_size_groups, eval_prep_file, and vqgan/data/eval_subset.py.
-    eval_params = {
-        "source": cfg.source, "tile_size": cfg.tile_size,
-        "tile_overlap_ratio": cfg.tile_overlap_ratio,
-        "eval_images": eval_images, "eval_size_groups": cfg.eval_size_groups,
-        "seed": cfg.seed,
-    }
-    if cfg.eval_prep_file:
-        cache = torch.load(cfg.eval_prep_file, map_location="cpu")
-        mismatched = {k: (cache["params"].get(k), v) for k, v in eval_params.items()
-                      if cache["params"].get(k) != v}
-        if mismatched:
-            raise RuntimeError(
-                f"{cfg.eval_prep_file} was built with different settings than this run "
-                f"(cached, current): {mismatched} — rebuild it with 'Create prep data file' "
-                "so it matches, or clear eval_prep_file to build the subset fresh"
+    #
+    # Only rank 0 ever calls evaluate(), so only rank 0 builds any of this —
+    # the others would be decoding thousands of crops to throw them away.
+    eval_val_crops = preview_images = None
+    if is_main:
+        eval_params = {
+            "source": cfg.source, "tile_size": cfg.tile_size,
+            "tile_overlap_ratio": cfg.tile_overlap_ratio,
+            "eval_images": eval_images, "eval_size_groups": cfg.eval_size_groups,
+            "seed": cfg.seed,
+        }
+        if cfg.eval_prep_file:
+            cache = torch.load(cfg.eval_prep_file, map_location="cpu")
+            mismatched = {k: (cache["params"].get(k), v) for k, v in eval_params.items()
+                          if cache["params"].get(k) != v}
+            if mismatched:
+                raise RuntimeError(
+                    f"{cfg.eval_prep_file} was built with different settings than this run "
+                    f"(cached, current): {mismatched} — rebuild it with 'Create prep data file' "
+                    "so it matches, or clear eval_prep_file to build the subset fresh"
+                )
+            eval_val_crops, eval_offsets = cache["crops"], cache["offsets"]
+            eval_selection = [SelectedImage(**d) for d in cache["selection"]]
+            console.print(
+                f"[bold]val readout[/bold] {eval_val_crops.shape[0]:,} crops loaded from "
+                f"{cfg.eval_prep_file} (skipped the validation-split scan)"
             )
-        eval_val_crops, eval_offsets = cache["crops"], cache["offsets"]
-        eval_selection = [SelectedImage(**d) for d in cache["selection"]]
-        console.print(
-            f"[bold]val readout[/bold] {eval_val_crops.shape[0]:,} crops loaded from "
-            f"{cfg.eval_prep_file} (skipped the validation-split scan)"
-        )
-    else:
-        size_edges = compute_log_size_edges(
-            val_ds.shards, tile_size=cfg.tile_size, num_groups=cfg.eval_size_groups
-        )
-        eval_selection = build_balanced_val_subset(
-            val_ds.shards, tile_size=cfg.tile_size, tile_overlap_ratio=cfg.tile_overlap_ratio,
-            edges=size_edges, max_crops_target=eval_images, seed=cfg.seed,
-        )
-        eval_val_crops, eval_offsets = materialize_selected_crops(
-            val_ds.shards, eval_selection, tile_size=cfg.tile_size,
-            tile_overlap_ratio=cfg.tile_overlap_ratio,
-        )
-        floor_note = f" (above the {cfg.eval_images:,} floor, 64 x batch {cfg.batch_size})" \
-            if eval_images != cfg.eval_images else ""
-        console.print(
-            f"[bold]val readout[/bold] {eval_val_crops.shape[0]:,} size-balanced crops from "
-            f"{len(eval_selection):,} image(s) across {cfg.eval_size_groups} size group(s), "
-            f"seed {cfg.seed}{floor_note}"
-        )
+        else:
+            size_edges = compute_log_size_edges(
+                val_ds.shards, tile_size=cfg.tile_size, num_groups=cfg.eval_size_groups
+            )
+            eval_selection = build_balanced_val_subset(
+                val_ds.shards, tile_size=cfg.tile_size, tile_overlap_ratio=cfg.tile_overlap_ratio,
+                edges=size_edges, max_crops_target=eval_images, seed=cfg.seed,
+            )
+            eval_val_crops, eval_offsets = materialize_selected_crops(
+                val_ds.shards, eval_selection, tile_size=cfg.tile_size,
+                tile_overlap_ratio=cfg.tile_overlap_ratio,
+            )
+            floor_note = f" (above the {cfg.eval_images:,} floor, 64 x batch {global_batch})" \
+                if eval_images != cfg.eval_images else ""
+            console.print(
+                f"[bold]val readout[/bold] {eval_val_crops.shape[0]:,} size-balanced crops from "
+                f"{len(eval_selection):,} image(s) across {cfg.eval_size_groups} size group(s), "
+                f"seed {cfg.seed}{floor_note}"
+            )
 
-    # One representative per size group for the recon-preview grid — the
-    # first image the round-robin picked from each group, reusing its
-    # already-decoded crops (all of them, not just one) rather than a
-    # separate pick.
-    seen_groups, preview_slices = set(), []
-    for sel, (start, end) in zip(eval_selection, eval_offsets):
-        if sel.group_index not in seen_groups:
-            seen_groups.add(sel.group_index)
-            preview_slices.append((start, end))
-    preview_images = torch.cat(
-        [eval_val_crops[start:end] for start, end in preview_slices], dim=0
-    ).to(device)
+        # One representative per size group for the recon-preview grid — the
+        # first image the round-robin picked from each group, reusing its
+        # already-decoded crops (all of them, not just one) rather than a
+        # separate pick.
+        seen_groups, preview_slices = set(), []
+        for sel, (start, end) in zip(eval_selection, eval_offsets):
+            if sel.group_index not in seen_groups:
+                seen_groups.add(sel.group_index)
+                preview_slices.append((start, end))
+        preview_images = torch.cat(
+            [eval_val_crops[start:end] for start, end in preview_slices], dim=0
+        ).to(device)
 
     global_step = 0
     images_seen = 0
@@ -268,7 +292,7 @@ def main(argv=None):
                 f"train from scratch."
             )
         model_config = resume_ckpt["model_config"]
-        if model_config != cfg.model_config():
+        if model_config != cfg.model_config() and is_main:
             console.print(
                 "[yellow]resume:[/yellow] using the architecture stored in the checkpoint, "
                 "not the CLI defaults"
@@ -287,12 +311,16 @@ def main(argv=None):
     discriminator = PatchDiscriminator().to(device)
     grid_size = model_config["image_size"] // model_config["patch_size"]
     n_params = sum(p.numel() for p in vqgan.parameters())
-    console.print(f"generator: {n_params / 1e6:.1f}M params, token grid {grid_size}x{grid_size}")
+    if is_main:
+        console.print(f"generator: {n_params / 1e6:.1f}M params, token grid {grid_size}x{grid_size}")
 
     if resume_ckpt is not None:
         vqgan.load_state_dict(resume_ckpt["vqgan"])
         if reset_discriminator:
-            console.print("[yellow]resume:[/yellow] discriminator reinitialized, generator kept")
+            if is_main:
+                console.print(
+                    "[yellow]resume:[/yellow] discriminator reinitialized, generator kept"
+                )
         else:
             try:
                 discriminator.load_state_dict(resume_ckpt["discriminator"])
@@ -320,18 +348,21 @@ def main(argv=None):
         images_seen = resume_ckpt.get(
             "images_seen", global_step * cfg.reference_batch_size
         )
-        console.print(
-            f"resumed from {cfg.resume} at {images_seen:,} images / step {global_step} "
-            f"(ema_switched={ema_switched})"
-        )
+        if is_main:
+            console.print(
+                f"resumed from {cfg.resume} at {images_seen:,} images / step {global_step} "
+                f"(ema_switched={ema_switched})"
+            )
 
-    base_lr = cfg.scaled_lr()
-    if base_lr != cfg.lr:
+    # DDP averages gradients across ranks, so the batch this rate is being
+    # scaled for is the global one, not this rank's share — see scaled_lr().
+    base_lr = cfg.scaled_lr(world_size)
+    if base_lr != cfg.lr and is_main:
         console.print(
             f"[bold]lr[/bold] {base_lr:.2e} — {cfg.lr:.2e} scaled by {cfg.lr_scaling} "
-            f"for batch {cfg.batch_size} vs reference {cfg.reference_batch_size}"
+            f"for batch {global_batch} vs reference {cfg.reference_batch_size}"
         )
-    if cfg.end_steps_lr != cfg.max_steps:
+    if cfg.end_steps_lr != cfg.max_steps and is_main:
         where = "before" if cfg.end_steps_lr < cfg.max_steps else "past"
         console.print(
             f"[bold]lr decay[/bold] reaches min_lr at {cfg.end_steps_lr:,} images, "
@@ -339,6 +370,20 @@ def main(argv=None):
             + ("lr sits flat at min_lr for the rest of the run"
                if cfg.end_steps_lr < cfg.max_steps
                else "lr never reaches min_lr within this run")
+        )
+
+    # Wrapped after any resume has been loaded, so DDP's constructor broadcasts
+    # the resumed weights to every rank rather than a fresh random init.
+    # broadcast_buffers=False because the one buffer set that has to agree
+    # across ranks — the quantizer's EMA codebook — is synced explicitly in
+    # VectorQuantizer.forward(); DDP's own per-forward broadcast would fight
+    # with that by reinstating rank 0's copy over everyone's local update.
+    if is_distributed:
+        vqgan = DistributedDataParallel(
+            vqgan, device_ids=[local_rank], broadcast_buffers=False
+        )
+        discriminator = DistributedDataParallel(
+            discriminator, device_ids=[local_rank], broadcast_buffers=False
         )
 
     # betas are a momentum window measured in steps, so unlike everything else
@@ -357,15 +402,18 @@ def main(argv=None):
         if "opt_d" in resume_ckpt:
             opt_d.load_state_dict(resume_ckpt["opt_d"])
 
+    # One writer and one tensorboard process for the run, not one per rank.
     tb_log_dir = out_dir / "tensorboard"
-    tb_writer = SummaryWriter(log_dir=str(tb_log_dir))
-    try:
-        subprocess.Popen(["tensorboard", "--logdir", str(tb_log_dir), "--port", "6006"])
-        console.print("[cyan]tensorboard:[/cyan] http://localhost:6006")
-    except FileNotFoundError:
-        console.print(
-            f"[yellow]tensorboard CLI not found on PATH[/yellow] — logs are still written to {tb_log_dir}"
-        )
+    tb_writer = None
+    if is_main:
+        tb_writer = SummaryWriter(log_dir=str(tb_log_dir))
+        try:
+            subprocess.Popen(["tensorboard", "--logdir", str(tb_log_dir), "--port", "6006"])
+            console.print("[cyan]tensorboard:[/cyan] http://localhost:6006")
+        except FileNotFoundError:
+            console.print(
+                f"[yellow]tensorboard CLI not found on PATH[/yellow] — logs are still written to {tb_log_dir}"
+            )
 
     vqgan.train()
     discriminator.train()
@@ -374,21 +422,26 @@ def main(argv=None):
     # Progress, logging and every trigger below are counted in images. Steps
     # are still counted, but only to name checkpoints and to average the
     # running loss over the batches that produced it.
-    pbar = tqdm(initial=images_seen, total=cfg.max_steps, desc="train", unit="img")
+    pbar = tqdm(initial=images_seen, total=cfg.max_steps, desc="train", unit="img") \
+        if is_main else None
 
     for images in infinite(train_loader):
         if images_seen >= cfg.max_steps:
             break
 
+        # Every rank flips at the same images_seen (the counter advances by the
+        # same global amount everywhere), so the collectives inside the EMA
+        # branch of the quantizer stay matched across ranks.
         if not ema_switched and images_seen >= cfg.ema_warmup_steps:
-            vqgan.quantizer.set_use_ema(True)
+            unwrap(vqgan).quantizer.set_use_ema(True)
             opt_g = torch.optim.Adam(
                 filter(lambda p: p.requires_grad, vqgan.parameters()), lr=base_lr, betas=(0.5, 0.9)
             )
             ema_switched = True
-            console.print(
-                f"{images_seen:,} images: [bold cyan]switched quantizer to EMA mode[/bold cyan]"
-            )
+            if is_main:
+                console.print(
+                    f"{images_seen:,} images: [bold cyan]switched quantizer to EMA mode[/bold cyan]"
+                )
 
         images = images.to(device, non_blocking=True)
 
@@ -416,36 +469,52 @@ def main(argv=None):
         running_n += 1
         global_step += 1
         previous_images = images_seen
-        images_seen += images.shape[0]
-        pbar.update(images.shape[0])
+        # The whole run's schedule is counted in images, so this counts the
+        # images *the run* consumed this step — every rank's batch, not just
+        # this one's. No collective needed: drop_last=True makes every rank's
+        # batch exactly cfg.batch_size, so the total is arithmetic. It also
+        # keeps this counter identical on every rank, which is what keeps the
+        # triggers below (and therefore the collectives they lead to) matched.
+        step_images = images.shape[0] * world_size
+        images_seen += step_images
+
+        if is_main:
+            pbar.update(step_images)
 
         if crossed(previous_images, images_seen, cfg.log_every_steps):
             avg = {k: v / running_n for k, v in running.items()}
-            postfix = {k: f"{v:.4f}" for k, v in avg.items()}
-            postfix["lr"] = f"{lr:.2e}"
-            pbar.set_postfix(postfix)
-            # x-axis in images, not steps, so curves from runs at different
-            # batch sizes lie on top of each other instead of being stretched
-            # apart by a factor of batch.
-            for k, v in avg.items():
-                tb_writer.add_scalar(f"train/{k}", v, images_seen)
-            tb_writer.add_scalar("train/lr", lr, images_seen)
-            tb_writer.add_scalar("train/global_step", global_step, images_seen)
+            if is_main:
+                postfix = {k: f"{v:.4f}" for k, v in avg.items()}
+                postfix["lr"] = f"{lr:.2e}"
+                pbar.set_postfix(postfix)
+                # x-axis in images, not steps, so curves from runs at different
+                # batch sizes lie on top of each other instead of being stretched
+                # apart by a factor of batch.
+                for k, v in avg.items():
+                    tb_writer.add_scalar(f"train/{k}", v, images_seen)
+                tb_writer.add_scalar("train/lr", lr, images_seen)
+                tb_writer.add_scalar("train/global_step", global_step, images_seen)
             running, running_n = {}, 0
 
-        if crossed(previous_images, images_seen, cfg.eval_every_steps):
-            evaluate(vqgan, eval_val_crops, device, out_dir, images_seen, preview_images,
-                     tb_writer, cfg.batch_size, amp)
+        # Rank 0 evaluates and writes; the others simply carry on to the next
+        # step and block at its gradient all-reduce until rank 0 catches up.
+        # evaluate() gets the unwrapped model so nothing touches DDP's
+        # per-iteration bookkeeping outside the training step itself.
+        if is_main and crossed(previous_images, images_seen, cfg.eval_every_steps):
+            evaluate(unwrap(vqgan), eval_val_crops, device, out_dir, images_seen,
+                     preview_images, tb_writer, cfg.batch_size, amp)
             vqgan.train()
 
-        if crossed(previous_images, images_seen, cfg.checkpoint_every_steps):
+        if is_main and crossed(previous_images, images_seen, cfg.checkpoint_every_steps):
             save_checkpoint(vqgan, discriminator, opt_g, opt_d, model_config,
                             global_step, images_seen, ema_switched, checkpoint_dir)
 
-    pbar.close()
-    save_checkpoint(vqgan, discriminator, opt_g, opt_d, model_config,
-                    global_step, images_seen, ema_switched, checkpoint_dir, tag="last")
-    tb_writer.close()
+    if is_main:
+        pbar.close()
+        save_checkpoint(vqgan, discriminator, opt_g, opt_d, model_config,
+                        global_step, images_seen, ema_switched, checkpoint_dir, tag="last")
+        tb_writer.close()
+    cleanup_distributed(is_distributed)
 
 
 @torch.no_grad()
@@ -516,8 +585,11 @@ def save_checkpoint(
         "images_seen": images_seen,
         "ema_switched": ema_switched,
         "model_config": model_config,
-        "vqgan": vqgan.state_dict(),
-        "discriminator": discriminator.state_dict(),
+        # unwrap() so a DDP run writes the same plain keys a single-GPU run
+        # does — DDP's own state_dict() would prefix everything with "module."
+        # and no other script in this project knows how to read that.
+        "vqgan": unwrap(vqgan).state_dict(),
+        "discriminator": unwrap(discriminator).state_dict(),
         "opt_g": opt_g.state_dict(),
         "opt_d": opt_d.state_dict(),
     }

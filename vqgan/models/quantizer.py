@@ -1,6 +1,20 @@
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _distributed() -> bool:
+    """True only inside a torchrun-launched process group.
+
+    The codebook is maintained by hand in forward() (and is
+    requires_grad=False in EMA mode), so DDP's gradient all-reduce never sees
+    it — every cross-rank agreement below has to be arranged explicitly. Read
+    from torch.distributed rather than taking a rank/world_size argument so
+    every single-process caller (scripts/evaluate.py, reconstruct.py, ...)
+    keeps working untouched.
+    """
+    return dist.is_available() and dist.is_initialized()
 
 
 class VectorQuantizer(nn.Module):
@@ -189,6 +203,27 @@ class VectorQuantizer(nn.Module):
                 )
                 batch_embed_sum.index_add_(0, token_indices_flat, z_detached.float())
 
+                # Both are plain sums over this step's tokens, so summing them
+                # across ranks is exactly the statistic a single process with
+                # the whole global batch would have computed. Without this each
+                # rank would run its own codebook off its own 1/N of the data
+                # and they would drift apart for the rest of the run. all_reduce
+                # hands every rank the identical result, which is also what lets
+                # the dead-code check below agree across ranks without a second
+                # collective.
+                #
+                # num_images has to grow with them: it is what converts the
+                # per-image decay into this step's decay (and what drives the
+                # revival counter), and this step just consumed world_size
+                # batches' worth of images, not one. Scaling it here is what
+                # keeps "cumulative decay after N images is the same however
+                # those N were grouped" true across GPU counts too, not just
+                # across batch sizes.
+                if _distributed():
+                    dist.all_reduce(batch_cluster_size, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(batch_embed_sum, op=dist.ReduceOp.SUM)
+                    num_images *= dist.get_world_size()
+
                 # Per-image decay compounded by this step's actual image
                 # count, not a flat per-step constant — see __init__ for why.
                 step_decay = self.ema_decay_per_image ** num_images
@@ -240,27 +275,43 @@ class VectorQuantizer(nn.Module):
         the encoder actually produces instead of a meaningless random spot.
 
         `z_flat` is already unit-norm when l2_normalize is on, so the
-        replacements land on the sphere along with the rest of the codebook."""
+        replacements land on the sphere along with the rest of the codebook.
+
+        Under DDP every rank computes the same `dead_mask` (ema_cluster_size is
+        all-reduced in forward()), so all of them arrive here together — but
+        the replacements are drawn from *this rank's* latents, and picking a
+        real vector is not a statistic that can be averaged the way the EMA
+        sums are. So rank 0 picks and broadcasts the result: any other split
+        would leave each rank holding a different codebook from here on."""
         threshold = self.dead_code_fraction * self.ema_cluster_size.mean()
         dead_mask = self.ema_cluster_size < threshold
         num_dead = int(dead_mask.sum().item())
         if num_dead == 0:
             return
 
-        replacement_idx = torch.randint(0, z_flat.shape[0], (num_dead,), device=z_flat.device)
-        # Under AMP, z_flat is bf16/fp16 (encoder runs inside autocast) while the
-        # codebook/EMA buffers are plain float32 — indexed assignment (unlike
-        # add_/mul_) requires an exact dtype match, so cast explicitly.
-        replacements = z_flat[replacement_idx].to(self.codebook.weight.dtype)
+        distributed = _distributed()
+        if not distributed or dist.get_rank() == 0:
+            replacement_idx = torch.randint(0, z_flat.shape[0], (num_dead,), device=z_flat.device)
+            # Under AMP, z_flat is bf16/fp16 (encoder runs inside autocast) while the
+            # codebook/EMA buffers are plain float32 — indexed assignment (unlike
+            # add_/mul_) requires an exact dtype match, so cast explicitly.
+            replacements = z_flat[replacement_idx].to(self.codebook.weight.dtype)
 
-        # Seed the revived entry right on the "just barely alive" line rather
-        # than at an absolute count, for the same scale-independence reason as
-        # the threshold itself. ema_embed_avg is a *weighted* sum, so it has to
-        # carry the same factor for `ema_embed_avg / cluster_size` to hand back
-        # the replacement vector unchanged.
-        self.codebook.weight.data[dead_mask] = replacements
-        self.ema_cluster_size[dead_mask] = threshold
-        self.ema_embed_avg[dead_mask] = replacements * threshold
+            # Seed the revived entry right on the "just barely alive" line rather
+            # than at an absolute count, for the same scale-independence reason as
+            # the threshold itself. ema_embed_avg is a *weighted* sum, so it has to
+            # carry the same factor for `ema_embed_avg / cluster_size` to hand back
+            # the replacement vector unchanged.
+            self.codebook.weight.data[dead_mask] = replacements
+            self.ema_cluster_size[dead_mask] = threshold
+            self.ema_embed_avg[dead_mask] = replacements * threshold
+
+        if distributed:
+            # Whole tensors rather than the masked slices: revival is rare
+            # (every revive_check_every images) and these are small, so the
+            # simple version costs nothing worth optimizing away.
+            for tensor in (self.codebook.weight.data, self.ema_cluster_size, self.ema_embed_avg):
+                dist.broadcast(tensor, src=0)
 
     def codebook_usage_pct(self) -> float:
         """Fraction of codebook entries used at least once since the last

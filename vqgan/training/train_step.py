@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 
 from ..losses import LPIPS_AVAILABLE, get_lpips_model, logit_laplace_nll
+from .distributed import unwrap
 
 
 def adaptive_disc_weight(nll_loss, gan_loss, last_layer, eps=1e-4):
@@ -85,6 +86,15 @@ def train_step(
     lpips_on = use_lpips and LPIPS_AVAILABLE
 
     # ---- Generator (encoder+quantizer+decoder) step ----
+    # The discriminator is only a gradient *path* in this half of the step:
+    # the generator needs d(gan_loss)/d(recon), never d/d(disc weights), and
+    # opt_d.zero_grad() below has always thrown the latter away unused.
+    # Freezing skips computing them in the first place — and under DDP it is
+    # load-bearing rather than an optimization, because DDP's reducer allows
+    # each parameter to be marked ready exactly once per iteration: letting
+    # g_loss.backward() reach discriminator parameters that d_loss.backward()
+    # then reaches again trips "marked ready twice".
+    discriminator.requires_grad_(False)
     opt_g.zero_grad(set_to_none=True)
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
         out = vqgan(real_images)
@@ -107,11 +117,21 @@ def train_step(
             + lpips_weight * perceptual_loss
         )
 
-        fake_logits = discriminator(out.recon)
+        # Raw module, not the DDP wrapper: DDP arms its reducer during forward
+        # and then expects that module's gradients to arrive in the backward
+        # that follows. They never will here (the weights are frozen just
+        # above), so going through the wrapper would leave the reducer waiting
+        # on a reduction that never happens. The discriminator's own step below
+        # is the pass that legitimately syncs it.
+        fake_logits = unwrap(discriminator)(out.recon)
         gan_loss_g = -fake_logits.mean()  # fool the discriminator
 
         if past_warmup:
-            d_weight = adaptive_disc_weight(nll_loss, gan_loss_g, vqgan.decoder.last_layer())
+            # unwrap(): DDP forwards __call__/parameters()/state_dict() but not
+            # attribute access, so `vqgan.decoder` is an AttributeError once the
+            # model is wrapped. On one GPU this returns `vqgan` itself.
+            last_layer = unwrap(vqgan).decoder.last_layer()
+            d_weight = adaptive_disc_weight(nll_loss, gan_loss_g, last_layer)
             effective_disc_weight = d_weight * disc_weight
         else:
             d_weight = torch.tensor(0.0, device=device)
@@ -126,6 +146,7 @@ def train_step(
     opt_g.step()
 
     # ---- Discriminator step ----
+    discriminator.requires_grad_(True)
     opt_d.zero_grad(set_to_none=True)
     with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=amp):
         real_logits = discriminator(real_images)

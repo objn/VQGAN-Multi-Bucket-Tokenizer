@@ -78,6 +78,8 @@ class CropDataset(IterableDataset):
         shuffle_buffer=1024,
         augment=True,
         seed=0,
+        rank=0,
+        world_size=1,
     ):
         self.shards = list(shards)
         self.tile_size = tile_size
@@ -86,6 +88,12 @@ class CropDataset(IterableDataset):
         self.shuffle_buffer = shuffle_buffer
         self.augment = augment
         self.seed = seed
+        # Which slice of the shard list this process takes, on top of the
+        # per-worker split __iter__ already does. The defaults are the
+        # single-process case and reduce that split to exactly what it was
+        # before DDP existed — see __iter__.
+        self.rank = rank
+        self.world_size = world_size
 
     def _crops(self, image, rng):
         w, h = image.size
@@ -114,10 +122,21 @@ class CropDataset(IterableDataset):
 
         # torch.initial_seed() is re-derived by the DataLoader for every worker
         # on every epoch, so this reshuffles shards and crop positions each
-        # pass without the dataset having to track an epoch counter itself.
-        rng = random.Random((torch.initial_seed() + self.seed) % (2**63))
+        # pass without the dataset having to track an epoch counter itself. It
+        # is identical across ranks, though — every process was seeded from the
+        # same cfg.seed — so rank has to be mixed in separately, or two GPUs
+        # would jitter and shuffle their (disjoint) shards in lockstep.
+        rng = random.Random(
+            (torch.initial_seed() + self.seed + self.rank * 100_003) % (2**63)
+        )
 
-        my_shards = self.shards[worker_id::num_workers]
+        # Workers within a process and processes within the run are the same
+        # kind of split, so they compose into one flat stride: worker w of rank
+        # r takes every (world_size * num_workers)th shard. At rank=0,
+        # world_size=1 this is exactly `shards[worker_id::num_workers]`.
+        global_worker_id = self.rank * num_workers + worker_id
+        total_workers = self.world_size * num_workers
+        my_shards = self.shards[global_worker_id::total_workers]
         if not self.shuffle:
             # Deterministic pass: shards in index order, no reservoir, so the
             # nth crop is always the same crop.

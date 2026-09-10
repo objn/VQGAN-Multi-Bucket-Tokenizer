@@ -267,14 +267,21 @@ class VQGANTrainConfig:
 
     seed: int = 24
 
-    def scaled_lr(self) -> float:
+    def scaled_lr(self, world_size: int = 1) -> float:
         """The learning rate to actually train at, given batch_size.
 
         Kept here rather than in the training loop so the number a run uses is
         derivable from its config alone — a checkpoint's config is the only
         record of what it was trained at.
+
+        Under DDP, batch_size is one GPU's share and DDP averages gradients
+        across ranks, so the noise this rule corrects for is set by
+        batch_size * world_size — the global batch. Passing world_size makes
+        an N-GPU run at a given global batch pick the same lr a 1-GPU run at
+        that batch would; the default of 1 leaves every single-process caller
+        computing exactly what it did before.
         """
-        ratio = self.batch_size / self.reference_batch_size
+        ratio = self.batch_size * world_size / self.reference_batch_size
         if self.lr_scaling == "none":
             return self.lr
         if self.lr_scaling == "linear":

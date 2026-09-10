@@ -13,12 +13,15 @@ is focused on getting ViT-VQGAN encode/decode reconstruction quality right first
 import json
 import re
 import shutil
+import subprocess
 import sys
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import torch
 
 from scripts import (
     build_index,
@@ -99,8 +102,47 @@ def run_prep_eval_data():
     prep_eval_data.main(["--source", source, "--batch-size", batch_size, "--out", out])
 
 
+def _launch_ddp(argv, num_gpus: int):
+    """Run scripts/train_vqgan.py under torchrun, one process per GPU.
+
+    DDP needs N operating-system processes, so this is the one menu action
+    that shells out instead of calling into the script in-process. Every flag
+    is the same one the single-GPU path passes — only --batch-size differs,
+    carrying this rank's share rather than the total.
+    """
+    script = Path(__file__).resolve().parent / "scripts" / "train_vqgan.py"
+    # --standalone: one box, no rendezvous endpoint to configure.
+    command = ["torchrun", "--standalone", f"--nproc_per_node={num_gpus}", str(script), *argv]
+    console.print(f"[dim]{' '.join(command)}[/dim]")
+    try:
+        subprocess.run(command, check=True)
+    except FileNotFoundError:
+        raise RuntimeError(
+            "torchrun was not found on PATH — it ships with torch, so this usually means the "
+            "menu is running under a different interpreter than the one torch is installed in"
+        ) from None
+
+
 def _run_training(source: str, *, lr_default, require_checkpoint: bool):
     defaults = VQGANTrainConfig()
+    # Asked first because it changes what the batch answer below *means*: with
+    # DDP the number is the total across cards, so that "batch 64" describes
+    # the same run whether it lands on one GPU or four.
+    use_ddp = ask("Use DDP (multi-GPU)? (y/n)", "n")
+    num_gpus = 1
+    if use_ddp.strip().lower().startswith("y"):
+        available = torch.cuda.device_count()
+        num_gpus = int(ask("Number of GPUs", available))
+        if num_gpus < 1:
+            raise RuntimeError(f"need at least 1 GPU to train, got {num_gpus}")
+        if num_gpus > available:
+            # Caught here rather than as "invalid device ordinal" from the rank
+            # that gets a card that isn't there, several screens of torchrun
+            # traceback later.
+            raise RuntimeError(
+                f"asked for {num_gpus} GPUs but torch can only see {available} on this machine"
+            )
+
     # No prompt for the index path: it is a fixed project location, and typing
     # a different one here without matching it in Build data index would
     # silently train on a stale index.
@@ -109,7 +151,28 @@ def _run_training(source: str, *, lr_default, require_checkpoint: bool):
     # "how long to train": that number is batch-invariant, so changing the
     # batch below only changes how fast it gets there, not the answer.
     max_steps = ask("Max steps", defaults.max_steps)
-    batch_size = ask("Batch size", defaults.batch_size)
+    if num_gpus > 1:
+        total_batch = int(ask(f"Batch size (total across {num_gpus} GPUs)", defaults.batch_size))
+        if total_batch % num_gpus:
+            # Refused rather than rounded: the schedule, the learning rate and
+            # the eval readout are all derived from batch x GPUs, so silently
+            # training at a different total than the one asked for would put
+            # every one of them somewhere the user did not choose.
+            floor = total_batch - total_batch % num_gpus
+            nearest = [n for n in (floor, floor + num_gpus) if n >= num_gpus]
+            raise RuntimeError(
+                f"batch size {total_batch} does not divide evenly across {num_gpus} GPUs "
+                f"({total_batch / num_gpus:.2f} images per GPU) — "
+                f"try {' or '.join(str(n) for n in nearest)}"
+            )
+        batch_size = str(total_batch // num_gpus)
+        console.print(
+            f"[dim]{total_batch} total = {batch_size} per GPU x {num_gpus} — the schedule, lr "
+            f"and eval readout all follow the total, so this matches a single-GPU run at "
+            f"batch {total_batch}[/dim]"
+        )
+    else:
+        batch_size = ask("Batch size", defaults.batch_size)
     lr = ask(f"Learning rate (at batch {defaults.reference_batch_size}, scaled from there)",
              lr_default)
 
@@ -142,7 +205,10 @@ def _run_training(source: str, *, lr_default, require_checkpoint: bool):
         argv += ["--resume", resume]
     if eval_prep_file:
         argv += ["--eval-prep-file", eval_prep_file]
-    train_vqgan.main(argv)
+    if num_gpus > 1:
+        _launch_ddp(argv, num_gpus)
+    else:
+        train_vqgan.main(argv)
 
 
 def run_train_vqgan():
