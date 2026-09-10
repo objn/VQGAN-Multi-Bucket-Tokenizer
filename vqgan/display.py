@@ -30,7 +30,10 @@ _LOSS_FIELDS = (
     ("laplace_loss", "laplace", 4),
     ("lpips_loss", "lpips", 4),
     ("vq_loss", "vq", 4),
-    ("d_weight", "d_w", 2),
+    # 8 places: the adaptive weight is a gradient-norm ratio that routinely
+    # sits in the 1e-3..1e-2 range (see train_step.adaptive_disc_weight), where
+    # two places round it to a flat 0.00 and hide the thing being watched.
+    ("d_weight", "d_w", 8),
 )
 
 
