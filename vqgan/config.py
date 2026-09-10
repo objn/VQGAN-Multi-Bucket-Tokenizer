@@ -253,7 +253,7 @@ class VQGANTrainConfig:
     # boundaries the adversarial term is what teaches the decoder to smooth
     # over. Esser et al., whose ratio this is, use 0.75-0.8 for the same
     # scalar; 1.0 here is at the top of that range.
-    disc_weight: float = 1.25
+    disc_weight: float = 1.5
     use_lpips: bool = True
 
     amp: bool = True            # autocast + train in bf16 (no GradScaler needed for bf16)
