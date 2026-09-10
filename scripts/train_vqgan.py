@@ -38,7 +38,7 @@ from vqgan.data.eval_subset import (
     materialize_selected_crops,
 )
 from vqgan.data.sources import FolderShard, ParquetShard, count_parquet_rows
-from vqgan.display import console, tqdm
+from vqgan.display import TrainingDisplay, console
 from vqgan.models import VQGAN, PatchDiscriminator
 from vqgan.training import cleanup_distributed, setup_distributed, train_step, unwrap
 
@@ -422,8 +422,10 @@ def main(argv=None):
     # Progress, logging and every trigger below are counted in images. Steps
     # are still counted, but only to name checkpoints and to average the
     # running loss over the batches that produced it.
-    pbar = tqdm(initial=images_seen, total=cfg.max_steps, desc="train", unit="img") \
+    display = TrainingDisplay(total_images=cfg.max_steps, initial_images=images_seen) \
         if is_main else None
+    if display is not None:
+        display.start()
 
     for images in infinite(train_loader):
         if images_seen >= cfg.max_steps:
@@ -479,14 +481,12 @@ def main(argv=None):
         images_seen += step_images
 
         if is_main:
-            pbar.update(step_images)
+            display.advance(step_images)
 
         if crossed(previous_images, images_seen, cfg.log_every_steps):
             avg = {k: v / running_n for k, v in running.items()}
             if is_main:
-                postfix = {k: f"{v:.4f}" for k, v in avg.items()}
-                postfix["lr"] = f"{lr:.2e}"
-                pbar.set_postfix(postfix)
+                display.set_losses(avg, lr)
                 # x-axis in images, not steps, so curves from runs at different
                 # batch sizes lie on top of each other instead of being stretched
                 # apart by a factor of batch.
@@ -502,7 +502,7 @@ def main(argv=None):
         # per-iteration bookkeeping outside the training step itself.
         if is_main and crossed(previous_images, images_seen, cfg.eval_every_steps):
             evaluate(unwrap(vqgan), eval_val_crops, device, out_dir, images_seen,
-                     preview_images, tb_writer, cfg.batch_size, amp)
+                     preview_images, tb_writer, cfg.batch_size, amp, display)
             vqgan.train()
 
         if is_main and crossed(previous_images, images_seen, cfg.checkpoint_every_steps):
@@ -510,7 +510,7 @@ def main(argv=None):
                             global_step, images_seen, ema_switched, checkpoint_dir)
 
     if is_main:
-        pbar.close()
+        display.stop()
         save_checkpoint(vqgan, discriminator, opt_g, opt_d, model_config,
                         global_step, images_seen, ema_switched, checkpoint_dir, tag="last")
         tb_writer.close()
@@ -519,7 +519,7 @@ def main(argv=None):
 
 @torch.no_grad()
 def evaluate(vqgan, eval_val_crops, device, out_dir, images_seen, preview_images, tb_writer,
-             batch_size, amp=False):
+             batch_size, amp=False, display=None):
     """Progress readout on a fixed, size-balanced subset of the validation
     split (see VQGANTrainConfig.eval_images/eval_size_groups and
     vqgan/data/eval_subset.py) — not what the validation set is: scripts/
@@ -548,12 +548,30 @@ def evaluate(vqgan, eval_val_crops, device, out_dir, images_seen, preview_images
         n += images.shape[0]
     val_l1 = total_l1 / max(n, 1)
 
-    usage_pct = vqgan.quantizer.codebook_usage_pct()
+    # Usage answers "how many codes are ever touched", perplexity answers "how
+    # many are actually carrying the representation" — a codebook can score
+    # ~100% on the first while a handful of codes take nearly every lookup.
+    # See VectorQuantizer.codebook_perplexity().
+    quantizer = vqgan.quantizer
+    usage_pct = quantizer.codebook_usage_pct()
+    used_count = quantizer.codebook_used_count()
+    perplexity = quantizer.codebook_perplexity()
+    num_embeddings = quantizer.num_embeddings
     console.print(
-        f"{images_seen:,} images: val L1 {val_l1:.4f}  codebook usage {usage_pct:.1f}%"
+        f"{images_seen:,} images: val L1 {val_l1:.4f}  "
+        f"codebook {used_count:,}/{num_embeddings:,} used ({usage_pct:.1f}%)  "
+        f"perplexity {perplexity:,.0f} ({100.0 * perplexity / num_embeddings:.1f}%)",
+        soft_wrap=True,  # one eval per line, so the run's history stays greppable
     )
     tb_writer.add_scalar("val/l1", val_l1, images_seen)
     tb_writer.add_scalar("val/codebook_usage_pct", usage_pct, images_seen)
+    tb_writer.add_scalar("val/codebook_used_count", used_count, images_seen)
+    tb_writer.add_scalar("val/codebook_perplexity", perplexity, images_seen)
+    tb_writer.add_scalar(
+        "val/codebook_perplexity_ratio", perplexity / num_embeddings, images_seen
+    )
+    if display is not None:
+        display.set_codebook(used_count, num_embeddings, usage_pct, perplexity)
 
     # preview_images is one representative image per size group and can run
     # well past batch_size crops (a large-group image may hold dozens), so

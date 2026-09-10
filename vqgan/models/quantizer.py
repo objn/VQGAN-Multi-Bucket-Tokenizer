@@ -318,5 +318,35 @@ class VectorQuantizer(nn.Module):
         reset_usage_stats() call, as a percentage."""
         return 100.0 * (self.usage_count > 0).float().mean().item()
 
+    def codebook_used_count(self) -> int:
+        """How many codes were used at least once since the last
+        reset_usage_stats() call — the same fact as codebook_usage_pct(),
+        as a count rather than a percentage."""
+        return int((self.usage_count > 0).sum().item())
+
+    def codebook_perplexity(self) -> float:
+        """Effective number of codes in use: exp(entropy) of the usage
+        distribution, between 1 and num_embeddings.
+
+        Worth reading next to codebook_usage_pct() because that one saturates:
+        a codebook where two codes take 90% of every lookup and the remaining
+        10% is spread over the other 16,382 still reports ~100% usage, while
+        perplexity reports ~2. "Used at least once" and "actually carrying the
+        representation" are different questions, and only the second one says
+        whether the codebook is really 16k codes wide.
+
+        Reads ema_cluster_size in EMA mode, which is already a running usage
+        distribution over recent images, and falls back to usage_count (reset
+        at every evaluate()) otherwise.
+        """
+        counts = self.ema_cluster_size if self.use_ema else self.usage_count
+        total = counts.sum()
+        if total <= 0:
+            return 0.0
+        p = counts / total
+        p = p[p > 0]  # 0 * log(0) is 0 in the limit, but log(0) is -inf
+        entropy = -(p * p.log()).sum()
+        return torch.exp(entropy).item()
+
     def reset_usage_stats(self):
         self.usage_count.zero_()
