@@ -34,6 +34,7 @@ from scripts import (
     visualize_model,
 )
 from vqgan.config import DataConfig, VQGANTrainConfig
+from vqgan.refine_config import RefineConfig
 from vqgan.display import console
 
 _STEP_CKPT_RE = re.compile(r"vqgan_step(\d+)\.pt")
@@ -223,6 +224,70 @@ def run_finetune_vqgan():
     _run_training("folder", lr_default=1e-5, require_checkpoint=True)
 
 
+def run_train_refine():
+    """Attach a RefinementHead to a chosen backbone, or carry on training one.
+
+    Its own menu entry rather than more questions inside Train/Finetune: the
+    entry point (attach to a backbone vs. continue a run) and the freeze mode
+    are decisions plain VQ training never has to make, and everyone training
+    without a head would have to answer them anyway.
+
+    The head's shape (--refine-hidden-channels, --refine-num-blocks) and its
+    finer schedule knobs (--refine-lr, --refine-warmup-steps) are left at
+    RefineConfig's defaults here. As the module docstring says, call
+    scripts/train_vqgan.py directly for full control over every flag.
+    """
+    defaults = VQGANTrainConfig()
+    console.print("[dim]source: images-parquet — same corpus as 'Train' (call "
+                  "scripts/train_vqgan.py with --source folder to refine on images/)[/dim]")
+
+    # Which of the two starting points this is. They load different amounts of
+    # the same file, and train_vqgan.py refuses both flags at once, so the
+    # menu asks once and passes exactly one.
+    entry = ask("Attach refine to a VQGAN checkpoint (a), or resume an existing refine run (r)?",
+                "a")
+    resume_flag, vqgan_ckpt_flag = [], []
+    if entry.strip().lower().startswith("r"):
+        resume_default = (latest_step_checkpoint(defaults.checkpoint_dir)
+                          or str(Path(defaults.checkpoint_dir) / "vqgan_last.pt"))
+        resume = ask("Resume from checkpoint", resume_default)
+        resume_flag = ["--resume", resume]
+        console.print("[dim]pick the same train stage this checkpoint was saved under — the "
+                      "generator's optimizer state is grouped by it[/dim]")
+    else:
+        default_checkpoint = str(Path(defaults.checkpoint_dir) / "vqgan_last.pt")
+        vqgan_checkpoint = ask("VQGAN backbone checkpoint to attach the head to",
+                               default_checkpoint)
+        vqgan_ckpt_flag = ["--vqgan-checkpoint", vqgan_checkpoint]
+
+    stage = ask("Train stage — joint (everything) / refine_only / vq_only", "refine_only")
+    if stage not in RefineConfig.STAGES:
+        # Caught by the menu loop and printed. Letting it through to
+        # train_vqgan.py instead would reach argparse's parser.error(), which
+        # raises SystemExit and would take the whole menu down with it.
+        raise ValueError(f"train stage must be one of {', '.join(RefineConfig.STAGES)}, "
+                         f"got {stage!r}")
+    max_steps = ask("Max steps", defaults.max_steps)
+    batch_size = ask("Batch size", defaults.batch_size)
+    # Lower than Train's default for the same reason Finetune's is: this
+    # starts from a backbone that is already converged, not from noise.
+    lr = ask(f"Learning rate (at batch {defaults.reference_batch_size}, scaled from there)", 1e-5)
+
+    use_prep = ask("Use a prep data file for the eval subset? (y/n)", "n")
+    prep_flag = []
+    if use_prep.strip().lower().startswith("y"):
+        prep_flag = ["--eval-prep-file",
+                     ask("Prep data file", defaults.eval_prep_file or "data/eval_prep.pt")]
+
+    argv = [
+        "--source", "parquet",
+        "--max-steps", max_steps, "--batch-size", batch_size, "--lr", lr,
+        "--refine-enabled", "true", "--refine-train-stage", stage,
+        *resume_flag, *vqgan_ckpt_flag, *prep_flag,
+    ]
+    train_vqgan.main(argv)
+
+
 def run_pack_result():
     defaults = VQGANTrainConfig()
     out_dir = Path(defaults.out_dir)
@@ -319,6 +384,8 @@ def main_menu():
         "8": ("Test whole images (tile + stitch + score)", run_test),
         "9": ("Reconstruct image (tile + stitch)", run_reconstruct),
         "10": ("Visualize model (TensorBoard graph)", run_visualize_model),
+        "11": ("Train Refinement Head (attach / continue, joint / refine_only / vq_only)",
+               run_train_refine),
         "0": ("Exit", None),
     }
     while True:

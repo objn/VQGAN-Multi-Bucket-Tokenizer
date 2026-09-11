@@ -1,5 +1,7 @@
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from .refine_config import RefineConfig
 
 
 @dataclass
@@ -46,6 +48,11 @@ class VQGANTrainConfig:
     mlp_ratio: float = 4.0
     code_dim: int = 32            # factorized: lookup happens in this space, not model_dim
     num_embeddings: int = 16384
+
+    # The refinement head, as a nested block rather than fields mixed in here.
+    # It lives in refine_config.py — that file says why — and only its three
+    # architecture fields reach model_config() below. CLI flags: --refine-<field>.
+    refine: RefineConfig = field(default_factory=RefineConfig)
 
     # Measured on a 12GB RTX 3080 Ti, at tile_size 256 with LPIPS on. Peak
     # memory reserved by torch, before the ~1.5GB the desktop already holds:
@@ -130,24 +137,30 @@ class VQGANTrainConfig:
     # eval_size_groups below) — computed once per run, not re-sampled every
     # evaluation call, so the curve stays comparable point-to-point.
     #
-    # A floor, in crops. The run uses max(eval_images, 64 * batch_size), so a
-    # machine big enough for a large batch spends its speed on a less noisy
-    # readout: 2,048 crops up to batch 32, 8,192 at batch 128. Note what that
-    # costs and what it gives up:
+    # A floor, in crops: the run uses max(eval_images, 64 * batch_size)
+    # (eval_image_floor() in vqgan/data/eval_subset.py), so a machine big
+    # enough for a large batch spends its speed on a less noisy readout. At
+    # the 8,192 here the floor is what binds all the way to batch 128, where
+    # 64 * batch first catches up with it; past that the readout grows with
+    # the batch (16,384 crops at batch 256). Note what that costs and what it
+    # gives up:
     #
     #   - it costs training time. Measured end to end (2,048 crops, bf16,
-    #     including the loader's worker startup): 30.3s, against ~528s of
-    #     training per 16,000 images at batch 8 — 5.7% of the run. The share
-    #     grows with the batch, because the readout grows and the interval
-    #     between readouts does not: ~23% at batch 128. Lower
-    #     eval_every_steps' twin, or pin --eval-images, if that is too much.
+    #     including the loader's worker startup): 30.3s, i.e. ~68 crops/s
+    #     against the ~30 crops/s the same card trains at. Scaling that
+    #     measurement to the 8,192 above puts one readout at ~120s, against
+    #     ~330s of training per eval_every_steps (10,000) images at batch 8 —
+    #     a quarter of the wall clock, and it stays about a quarter up to
+    #     batch 128, since both the readout and the training between readouts
+    #     are counted in images. Lower eval_images, or raise
+    #     eval_every_steps, if that is too much.
     #   - the prefix length changes the number itself. Measured on the 40k
     #     checkpoint: 0.14689 over 512 crops, 0.14863 over 1,024, 0.14738 over
     #     2,048, 0.14476 over 4,096 — a spread of 0.004, which is real
-    #     training progress' worth. Val curves are therefore comparable
-    #     between runs at the same batch size, not across different ones.
-    #     Pin --eval-images above 64 * batch_size when comparing runs that
-    #     used different batches.
+    #     training progress' worth. Runs are therefore only comparable to each
+    #     other when they evaluated on the same number of crops: at this
+    #     default that covers every batch size up to 128, and past that pin
+    #     --eval-images above 64 * batch_size to keep it true.
     eval_images: int = 8_192
     # How the eval_images crops above are *chosen*, not how many. A
     # sequential (or plain random) prefix of the validation split is badly
@@ -197,22 +210,37 @@ class VQGANTrainConfig:
     # Epochs are still too coarse a unit to schedule on: one pass over
     # ImageNet-1k is ~3.8M crops at the current tiling.
     max_steps: int = 3_400_000
-    # 0 = EMA codebook updates from the very first step. The old pipeline warmed
-    # up with gradient-based updates first, on the theory that EMA from step 0
-    # locks in a noisy encoder — but measured over 1500 steps that warmup is
-    # actively harmful here: gradient updates alone never break the initial
-    # index collapse (codebook usage sat at 0.0-0.1% for the whole warmup, so
-    # the encoder was training through a one-code bottleneck and val L1 *rose*,
-    # 0.377 -> 0.490), and only EMA plus dead-code revival pulled it out. With
-    # warmup off, val L1 at step 250 already beat what the warmed-up run reached
-    # at step 1500 (0.238 vs 0.233 at 6x the steps) and codebook usage ended
-    # higher (61% vs 52%). Set this above 0 to get the old behavior back.
+    # Images of gradient-based codebook updates before the quantizer switches
+    # to EMA. 0 = EMA from the very first image.
+    #
+    # A long warmup is what the old pipeline did, on the theory that EMA from
+    # step 0 locks in a noisy encoder, and measured over 1,500 *optimizer
+    # steps* it was actively harmful: gradient updates alone never broke the
+    # initial index collapse (codebook usage sat at 0.0-0.1% for the whole
+    # warmup, so the encoder was training through a one-code bottleneck and
+    # val L1 *rose*, 0.377 -> 0.490), and only EMA plus dead-code revival
+    # pulled it out. With warmup off, val L1 at step 250 already beat what the
+    # warmed-up run reached at step 1500 (0.238 vs 0.233 at 6x the steps) and
+    # codebook usage ended higher (61% vs 52%).
+    #
+    # The 10,000 here is not that warmup. It is counted in images like
+    # everything else in this section, so what it buys is a few dozen to a few
+    # hundred optimizer steps, not 1,500 — the checkpoints in checkpoints/
+    # switched at step 157, having trained at batch 64. That is a short
+    # settling period for the encoder, far from the regime the measurement
+    # above condemns. Raise it by an order of magnitude and that measurement
+    # starts to apply again.
     ema_warmup_steps: int = 10_000
     disc_warmup_steps: int = 20_000   # images before adversarial loss contributes to g_loss
     # 0 = no LR warmup, cosine decay starts at base_lr on image 0 (the old
     # behavior). Above 0, lr ramps linearly from 0 up to base_lr over this
     # many images, then the cosine decay in cosine_lr() takes over from
-    # base_lr down to min_lr over the images remaining until max_steps.
+    # base_lr down to min_lr over the images remaining until end_steps_lr —
+    # that field, not max_steps, is what the decay is measured against, and
+    # the two are only equal because they are currently set to the same number.
+    #
+    # The refinement head can carry its own ramp (RefineConfig.lr_warmup_steps)
+    # when it is given its own rate; by default it shares this one.
     lr_warmup_steps: int = 10_000
     eval_every_steps: int = 10_000
     checkpoint_every_steps: int = 100_000
@@ -230,10 +258,19 @@ class VQGANTrainConfig:
     # already divides by a running gradient magnitude, so only the *noise* term
     # is left to correct for, which grows as sqrt(batch) — and 1.6e-3 is well
     # into the range where a ViT plus an adversarial term goes unstable.
+    #
+    # RefineConfig.lr/lr_scaling are the refinement head's own pair, put
+    # through this same scaled_lr() so a rate quoted there means the same
+    # thing — the rate at reference_batch_size — as one quoted here.
     lr: float = 1e-4
     lr_scaling: str = "sqrt"
     min_lr: float = 1e-6
-    end_steps_lr: float = 3_400_000  # images at which lr decays to min_lr
+    # Images at which lr reaches min_lr — the end of the cosine, which is not
+    # required to be the end of the run (see cosine_lr()). A run much shorter
+    # than this only walks the first, nearly flat part of the curve: at
+    # 200,000 images against this 3.4M endpoint, lr is still ~99% of base.
+    # RefineConfig.end_steps_lr is the head's own copy, for exactly that case.
+    end_steps_lr: float = 3_400_000
 
     # ViT-VQGAN loss weights.
     l2_weight: float = 1.0
@@ -252,7 +289,12 @@ class VQGANTrainConfig:
     # essentially no say, and reconstructions stayed blocky at the 8x8 patch
     # boundaries the adversarial term is what teaches the decoder to smooth
     # over. Esser et al., whose ratio this is, use 0.75-0.8 for the same
-    # scalar; 1.0 here is at the top of that range.
+    # scalar. This sat at 1.0, the top of that range, and has since been
+    # raised twice (1.0 -> 1.25 -> 1.5) chasing those same patch-boundary
+    # artifacts, so it is now roughly double what the paper uses — deliberate,
+    # but worth knowing when reading a run's d_weight against theirs. The
+    # conv refinement head (vqgan/refine_config.py) is the other, more direct
+    # attack on the same artifact.
     disc_weight: float = 1.5
     use_lpips: bool = True
 
@@ -261,13 +303,13 @@ class VQGANTrainConfig:
     # depend on batch size and 1.0 keeps its meaning. Its variance does shrink
     # with a larger batch, though, so clipping fires less often — one of the
     # two places batch size still leaks into training, along with Adam's betas
-    # (a momentum window measured in steps; see the optimizer in
-    # scripts/train_vqgan.py). Both are left fixed on purpose.
+    # (a momentum window measured in optimizer steps, not images; see
+    # build_opt_g() in scripts/train_vqgan.py). Both are left fixed on purpose.
     grad_clip_norm: float = 1.0
 
     seed: int = 24
 
-    def scaled_lr(self, world_size: int = 1) -> float:
+    def scaled_lr(self, world_size: int = 1, *, lr=None, scaling=None) -> float:
         """The learning rate to actually train at, given batch_size.
 
         Kept here rather than in the training loop so the number a run uses is
@@ -280,15 +322,23 @@ class VQGANTrainConfig:
         an N-GPU run at a given global batch pick the same lr a 1-GPU run at
         that batch would; the default of 1 leaves every single-process caller
         computing exactly what it did before.
+
+        `lr`/`scaling` override which rate and which rule are being scaled,
+        leaving the batch arithmetic alone: the refinement head brings its own
+        pair (RefineConfig.lr/lr_scaling) and has to be scaled against this
+        run's batch the same way, and it would drift out of agreement with the
+        VQ side if it were scaled anywhere else.
         """
+        lr = self.lr if lr is None else lr
+        scaling = self.lr_scaling if scaling is None else scaling
         ratio = self.batch_size * world_size / self.reference_batch_size
-        if self.lr_scaling == "none":
-            return self.lr
-        if self.lr_scaling == "linear":
-            return self.lr * ratio
-        if self.lr_scaling == "sqrt":
-            return self.lr * math.sqrt(ratio)
-        raise ValueError(f"lr_scaling must be sqrt, linear or none, got {self.lr_scaling!r}")
+        if scaling == "none":
+            return lr
+        if scaling == "linear":
+            return lr * ratio
+        if scaling == "sqrt":
+            return lr * math.sqrt(ratio)
+        raise ValueError(f"lr_scaling must be sqrt, linear or none, got {scaling!r}")
 
     def model_config(self) -> dict:
         """The subset of this config that defines the network's shape.
@@ -305,4 +355,10 @@ class VQGANTrainConfig:
             "mlp_ratio": self.mlp_ratio,
             "code_dim": self.code_dim,
             "num_embeddings": self.num_embeddings,
+            # Only RefineConfig's architecture fields — train_stage/lr/
+            # warmup_steps describe a run, not a network, and a checkpoint
+            # that carried them would be claiming they are part of its shape.
+            "refine_enabled": self.refine.enabled,
+            "refine_hidden_channels": self.refine.hidden_channels,
+            "refine_num_blocks": self.refine.num_blocks,
         }

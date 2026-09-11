@@ -11,9 +11,14 @@ Usage:
     python scripts/train_vqgan.py --max-steps 1600000
     python scripts/train_vqgan.py --batch-size 128         # schedule unchanged, just faster
     python scripts/train_vqgan.py --resume checkpoints/vqgan_last.pt
+
+    # attach a refinement head to a trained backbone and train it alone
+    python scripts/train_vqgan.py --vqgan-checkpoint checkpoints/vqgan_step0028582.pt \
+        --refine-enabled true --refine-train-stage refine_only
 """
 
 import argparse
+import dataclasses
 import json
 import math
 import subprocess
@@ -29,6 +34,7 @@ from torchvision.utils import make_grid, save_image
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from vqgan.config import DataConfig, VQGANTrainConfig
+from vqgan.refine_config import RefineConfig
 from vqgan.data import CropDataset, build_shards
 from vqgan.data.eval_subset import (
     SelectedImage,
@@ -78,26 +84,193 @@ def crossed(previous: int, current: int, every: int) -> bool:
     return every > 0 and current // every > previous // every
 
 
+# The refinement head's parameters, by name, in every state_dict and
+# named_parameters() this script walks. One constant, so the freezing, the
+# optimizer split and the state-dict check below cannot drift apart.
+REFINE_PREFIX = "decoder.refine."
+
+
 def parse_args(argv=None):
-    """-> (config, reset_discriminator). Flags are derived from the dataclass
-    fields, so adding a config knob adds its flag automatically; anything that
-    is not a property of the run itself (like --reset-discriminator, which is
-    about one resume) is added by hand and kept out of the config."""
+    """-> (config, reset_discriminator, vqgan_checkpoint). Flags are derived
+    from the dataclass fields, so adding a config knob adds its flag
+    automatically; anything that is not a property of the run itself (like
+    --reset-discriminator, which is about one resume) is added by hand and
+    kept out of the config."""
     defaults = VQGANTrainConfig()
     parser = argparse.ArgumentParser(description=__doc__)
-    for field, default in defaults.__dict__.items():
-        flag = "--" + field.replace("_", "-")
-        if isinstance(default, bool):
-            parser.add_argument(flag, type=lambda s: s.lower() != "false", default=default)
-        else:
-            parser.add_argument(flag, type=type(default), default=default)
+
+    def add_flags(fields, prefix=""):
+        for field, default in fields:
+            flag = "--" + (prefix + field).replace("_", "-")
+            if isinstance(default, bool):
+                parser.add_argument(flag, type=lambda s: s.lower() != "false", default=default)
+            else:
+                parser.add_argument(flag, type=type(default), default=default)
+
+    # A nested config block (RefineConfig) is not something the loop above can
+    # derive a flag from, so its fields get their own pass under a
+    # --<block>-<field> prefix. --refine-lr then stays visibly separate from
+    # --lr, which is the point of keeping the block separate to begin with.
+    nested = {name: value for name, value in defaults.__dict__.items()
+              if dataclasses.is_dataclass(value)}
+    add_flags([(n, v) for n, v in defaults.__dict__.items() if n not in nested])
+    for name, block in nested.items():
+        add_flags(block.__dict__.items(), prefix=f"{name}_")
+
     parser.add_argument(
         "--reset-discriminator", action="store_true",
         help="resume the generator but start the discriminator from scratch",
     )
+    parser.add_argument(
+        "--vqgan-checkpoint", default="",
+        help="take the trained weights out of this checkpoint and start a fresh run around "
+             "them - schedule back at image 0, and a new generator optimizer, since attaching "
+             "a refinement head changes which parameters the generator has (the discriminator "
+             "and its optimizer come across unchanged). This is how a head gets attached to a "
+             "chosen backbone; --resume, which continues a run with its optimizer state and "
+             "image count intact, is the other thing",
+    )
+
     args = vars(parser.parse_args(argv))
     reset_discriminator = args.pop("reset_discriminator")
-    return VQGANTrainConfig(**args), reset_discriminator
+    vqgan_checkpoint = args.pop("vqgan_checkpoint")
+    blocks = {
+        name: type(block)(**{f: args.pop(f"{name}_{f}") for f in block.__dict__})
+        for name, block in nested.items()
+    }
+    cfg = VQGANTrainConfig(**args, **blocks)
+
+    if cfg.resume and vqgan_checkpoint:
+        parser.error(
+            "--resume and --vqgan-checkpoint both name a checkpoint to start from, but they "
+            "mean different things: --resume continues that run (optimizer state, image "
+            "count, EMA state), --vqgan-checkpoint keeps only its weights and starts a new "
+            "run. Pass one or the other."
+        )
+    if cfg.refine.train_stage not in RefineConfig.STAGES:
+        parser.error(
+            f"--refine-train-stage must be one of {', '.join(RefineConfig.STAGES)}, "
+            f"got {cfg.refine.train_stage!r}"
+        )
+    return cfg, reset_discriminator, vqgan_checkpoint
+
+
+def merge_refine_config(model_config: dict, refine: RefineConfig, is_main: bool) -> dict:
+    """The architecture to build, given the one stored in a checkpoint and the
+    refinement head this run asks for.
+
+    The backbone always comes from the checkpoint (see the resume block in
+    main()), and so does the head - with the one exception that is the whole
+    point of --refine-enabled: a checkpoint with no head, plus a run that wants
+    one, is how a head gets attached to an already-trained backbone.
+
+    The reverse is deliberately not symmetric. A checkpoint that carries a head
+    keeps it even if this run never mentions one, because those weights are in
+    the file and quietly dropping them would change what the model is;
+    --refine-train-stage vq_only is how to train around it instead.
+    """
+    merged = dict(model_config)
+    # Checkpoints written before the head existed carry none of these keys.
+    merged.setdefault("refine_enabled", False)
+    merged.setdefault("refine_hidden_channels", refine.hidden_channels)
+    merged.setdefault("refine_num_blocks", refine.num_blocks)
+
+    if refine.enabled and not merged["refine_enabled"]:
+        merged.update(
+            refine_enabled=True,
+            refine_hidden_channels=refine.hidden_channels,
+            refine_num_blocks=refine.num_blocks,
+        )
+        if is_main:
+            console.print(
+                f"[yellow]refine:[/yellow] attaching a new RefinementHead "
+                f"({refine.hidden_channels} channels x {refine.num_blocks} blocks) to a "
+                f"checkpoint that has none"
+            )
+    elif merged["refine_enabled"] and is_main:
+        asked = (refine.hidden_channels, refine.num_blocks)
+        stored = (merged["refine_hidden_channels"], merged["refine_num_blocks"])
+        if refine.enabled and asked != stored:
+            console.print(
+                f"[yellow]refine:[/yellow] head shape comes from the checkpoint "
+                f"({stored[0]} channels x {stored[1]} blocks), not the requested "
+                f"({asked[0]} x {asked[1]}) - its weights are that shape"
+            )
+        elif not refine.enabled:
+            console.print(
+                "[yellow]refine:[/yellow] the checkpoint carries a RefinementHead, so it is "
+                "kept and trained (--refine-train-stage vq_only trains around it)"
+            )
+    return merged
+
+
+def apply_train_stage(vqgan, stage: str, *, ema_on: bool):
+    """Freeze/unfreeze the generator for `stage` - see RefineConfig.train_stage.
+
+    "joint" is a no-op in a fresh run, where everything requires grad already,
+    but not after a stage change, which is why it is spelled out rather than
+    skipped.
+
+    `ema_on` is what stops this from undoing the EMA switch: once the quantizer
+    updates its codebook from EMA buffers, that weight is out of the optimizer
+    for good, and handing it a gradient back here would leave two mechanisms
+    writing the same tensor.
+    """
+    for name, p in unwrap(vqgan).named_parameters():
+        if name.startswith(REFINE_PREFIX):
+            p.requires_grad_(stage != "vq_only")
+        else:
+            frozen_codebook = ema_on and name == "quantizer.codebook.weight"
+            p.requires_grad_(stage != "refine_only" and not frozen_codebook)
+
+
+def set_train_mode(vqgan, stage: str):
+    """vqgan.train(), except that "refine_only" holds the quantizer in eval mode.
+
+    The codebook's EMA update and its dead-code revival are gated on
+    self.training, not on requires_grad, so clearing gradients alone would
+    leave the codebook drifting underneath a head that is being trained
+    against a backbone which is supposed to be standing still.
+
+    One thing to read carefully because of this: with EMA updates off, the
+    quantizer falls back to reporting its gradient-mode vq_loss (codebook +
+    commitment rather than commitment alone), so the logged vq number jumps
+    when a run crosses between refine_only and joint. Neither term reaches a
+    frozen encoder or a codebook that is out of the optimizer, so it is a
+    readout changing units, not a loss changing behaviour.
+    """
+    vqgan.train()
+    if stage == "refine_only":
+        unwrap(vqgan).quantizer.eval()
+
+
+def build_opt_g(vqgan, base_lr: float, refine_lr: float):
+    """The generator's Adam, over whatever is trainable at the moment.
+
+    betas are a momentum window measured in steps, so unlike everything else
+    here they do shift with batch size. Left fixed: (0.5, 0.9) is the pairing
+    GAN training is known to be stable at, and compounding them per image the
+    way the codebook EMA does would leave essentially no momentum at all at
+    large batches (0.5 ** 16 is 1.5e-5).
+
+    With `refine_lr` above 0 the head gets its own param group, tagged
+    `refine_group` so the training loop can drive it with the head's own
+    schedule (RefineConfig.lr and the three fields under it) instead of the
+    generator's: a head attached to a backbone millions of images into its
+    decay would otherwise be born at whatever near-min_lr rate that schedule
+    has reached. `refine_lr` is the already-scaled rate — see
+    VQGANTrainConfig.scaled_lr.
+    """
+    trainable = [(n, p) for n, p in unwrap(vqgan).named_parameters() if p.requires_grad]
+    if refine_lr <= 0:
+        groups = [{"params": [p for _, p in trainable]}]
+    else:
+        head = [p for n, p in trainable if n.startswith(REFINE_PREFIX)]
+        rest = [p for n, p in trainable if not n.startswith(REFINE_PREFIX)]
+        groups = [g for g in ({"params": rest},
+                              {"params": head, "lr": refine_lr, "refine_group": True})
+                  if g["params"]]
+    return torch.optim.Adam(groups, lr=base_lr, betas=(0.5, 0.9))
 
 
 def infinite(loader):
@@ -130,7 +303,7 @@ def load_index(path):
 
 
 def main(argv=None):
-    cfg, reset_discriminator = parse_args(argv)
+    cfg, reset_discriminator, vqgan_checkpoint = parse_args(argv)
     torch.manual_seed(cfg.seed)
     # (False, 0, 0, 1) unless torchrun launched this, in which case every
     # count below that multiplies by world_size degenerates to what a single
@@ -277,21 +450,32 @@ def main(argv=None):
     ema_switched = False
     resume_ckpt = None
 
-    # The shape of the network is a fixed property of an already-trained
-    # checkpoint — read it from the checkpoint itself on resume rather than
-    # from cfg (whose defaults can drift between runs), otherwise
-    # load_state_dict below fails with a shape mismatch the moment the two
-    # disagree.
+    # Two flags, one file to read, and they differ in how much of it they
+    # take. --resume continues a run: weights, optimizers, image count, EMA
+    # state. --vqgan-checkpoint takes the weights alone and starts a new run
+    # around them — which is what choosing a backbone to attach a refinement
+    # head to needs, since the head changes the parameter set and the optimizer
+    # state saved next to those weights no longer describes it. parse_args()
+    # has already rejected both being passed at once.
+    #
+    # Either way the shape of the network is a fixed property of the file and
+    # is read back from it rather than from cfg (whose defaults drift between
+    # runs), otherwise load_state_dict below fails with a shape mismatch the
+    # moment the two disagree. merge_refine_config() is the one seam where this
+    # run gets a say: attaching a head the checkpoint does not have.
+    checkpoint_path = cfg.resume or vqgan_checkpoint
+    backbone_only = bool(vqgan_checkpoint)
+
     model_config = cfg.model_config()
-    if cfg.resume:
-        resume_ckpt = torch.load(cfg.resume, map_location=device)
+    if checkpoint_path:
+        resume_ckpt = torch.load(checkpoint_path, map_location=device)
         if "model_config" not in resume_ckpt:
             raise ValueError(
-                f"{cfg.resume} has no model_config entry — it predates the ViT-VQGAN rewrite and "
-                f"holds CNN encoder/decoder weights that cannot be loaded. Move it aside and "
-                f"train from scratch."
+                f"{checkpoint_path} has no model_config entry — it predates the ViT-VQGAN "
+                f"rewrite and holds CNN encoder/decoder weights that cannot be loaded. Move it "
+                f"aside and train from scratch."
             )
-        model_config = resume_ckpt["model_config"]
+        model_config = merge_refine_config(resume_ckpt["model_config"], cfg.refine, is_main)
         if model_config != cfg.model_config() and is_main:
             console.print(
                 "[yellow]resume:[/yellow] using the architecture stored in the checkpoint, "
@@ -315,7 +499,31 @@ def main(argv=None):
         console.print(f"generator: {n_params / 1e6:.1f}M params, token grid {grid_size}x{grid_size}")
 
     if resume_ckpt is not None:
-        vqgan.load_state_dict(resume_ckpt["vqgan"])
+        # A head this run is attaching for the first time is the one thing
+        # allowed to be missing from the checkpoint. strict=False alone would
+        # also wave through a genuinely mismatched checkpoint, so the keys it
+        # let slide are checked by hand: anything missing outside the head, or
+        # anything unexpected at all, is still an error.
+        attaching_refine = (
+            model_config["refine_enabled"]
+            and REFINE_PREFIX + "in_conv.weight" not in resume_ckpt["vqgan"]
+        )
+        if attaching_refine:
+            incompatible = vqgan.load_state_dict(resume_ckpt["vqgan"], strict=False)
+            stray = [k for k in incompatible.missing_keys if not k.startswith(REFINE_PREFIX)]
+            if stray or incompatible.unexpected_keys:
+                raise ValueError(
+                    f"{checkpoint_path} does not match this architecture — missing {stray}, "
+                    f"unexpected {list(incompatible.unexpected_keys)}"
+                )
+            if is_main:
+                console.print(
+                    "[yellow]refine:[/yellow] RefinementHead started fresh (zero-init, so the "
+                    "model reconstructs exactly as it did before until the head trains); "
+                    "everything else loaded from the checkpoint"
+                )
+        else:
+            vqgan.load_state_dict(resume_ckpt["vqgan"])
         if reset_discriminator:
             if is_main:
                 console.print(
@@ -326,7 +534,7 @@ def main(argv=None):
                 discriminator.load_state_dict(resume_ckpt["discriminator"])
             except RuntimeError as e:
                 raise ValueError(
-                    f"{cfg.resume} holds a discriminator this code cannot load: {e}\n"
+                    f"{checkpoint_path} holds a discriminator this code cannot load: {e}\n"
                     f"Checkpoints written before the discriminator moved from BatchNorm to "
                     f"GroupNorm carry running_mean/running_var buffers that no longer exist. "
                     f"Pass --reset-discriminator to resume the generator and train a fresh "
@@ -342,17 +550,55 @@ def main(argv=None):
             vqgan.quantizer.use_ema = True
             vqgan.quantizer.codebook.weight.requires_grad_(False)
 
-        global_step = resume_ckpt["global_step"]
-        # Checkpoints from before the schedule was counted in images only know
-        # their step count, which meant reference_batch_size images each.
-        images_seen = resume_ckpt.get(
-            "images_seen", global_step * cfg.reference_batch_size
-        )
-        if is_main:
-            console.print(
-                f"resumed from {cfg.resume} at {images_seen:,} images / step {global_step} "
-                f"(ema_switched={ema_switched})"
+        if backbone_only:
+            # global_step and images_seen stay at 0: this is a new run, and its
+            # schedule (lr decay, warmups, eval and checkpoint cadence) should
+            # start from the beginning. ema_switched above is the exception —
+            # it is a property of the codebook that came in the file, and
+            # putting a converged codebook back through the gradient-update
+            # warmup would only unsettle it.
+            if is_main:
+                console.print(
+                    f"backbone loaded from {vqgan_checkpoint} (ema_switched={ema_switched}) — "
+                    f"schedule and image count start from zero, generator optimizer fresh, "
+                    f"discriminator and its optimizer carried over"
+                )
+        else:
+            global_step = resume_ckpt["global_step"]
+            # Checkpoints from before the schedule was counted in images only
+            # know their step count, which meant reference_batch_size images each.
+            images_seen = resume_ckpt.get(
+                "images_seen", global_step * cfg.reference_batch_size
             )
+            if is_main:
+                console.print(
+                    f"resumed from {cfg.resume} at {images_seen:,} images / step {global_step} "
+                    f"(ema_switched={ema_switched})"
+                )
+
+    # Which half of the model trains. Applied before DDP wraps the model, since
+    # DDP reads requires_grad when it builds its reducer, and before opt_g,
+    # which is built from whatever is trainable once this has run.
+    train_stage = cfg.refine.train_stage
+    if train_stage == "refine_only" and not model_config["refine_enabled"]:
+        raise ValueError(
+            "--refine-train-stage refine_only has nothing to train: this run has no "
+            "refinement head. Pass --refine-enabled true, with --vqgan-checkpoint <file> to "
+            "attach one to an already-trained backbone."
+        )
+    if train_stage != "joint":
+        apply_train_stage(vqgan, train_stage, ema_on=ema_switched)
+        if is_main:
+            trainable = sum(p.numel() for p in vqgan.parameters() if p.requires_grad)
+            console.print(
+                f"[bold]train stage[/bold] {train_stage} — {trainable / 1e6:.2f}M of "
+                f"{n_params / 1e6:.1f}M generator params training"
+            )
+    if cfg.refine.warmup_steps > 0 and train_stage == "refine_only" and is_main:
+        console.print(
+            f"[bold]refine warmup[/bold] backbone unfreezes at "
+            f"{cfg.refine.warmup_steps:,} images (refine_only -> joint)"
+        )
 
     # DDP averages gradients across ranks, so the batch this rate is being
     # scaled for is the global one, not this rank's share — see scaled_lr().
@@ -386,19 +632,62 @@ def main(argv=None):
             discriminator, device_ids=[local_rank], broadcast_buffers=False
         )
 
-    # betas are a momentum window measured in steps, so unlike everything else
-    # here they do shift with batch size. Left fixed: (0.5, 0.9) is the pairing
-    # GAN training is known to be stable at, and compounding them per image the
-    # way the codebook EMA does would leave essentially no momentum at all at
-    # large batches (0.5 ** 16 is 1.5e-5).
-    opt_g = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, vqgan.parameters()), lr=base_lr, betas=(0.5, 0.9)
-    )
-    opt_d = torch.optim.Adam(discriminator.parameters(), lr=base_lr, betas=(0.5, 0.9))
+    # The head's schedule, resolved once here rather than per step. Each field
+    # reads 0/"" as "whatever the VQ side does" (see RefineConfig), which is
+    # what `or` is spelling out below; with refine.lr itself at 0 none of it is
+    # used at all and the head rides base_lr in the single param group.
+    refine_lr_on = cfg.refine.lr > 0
+    refine_base_lr = cfg.scaled_lr(
+        world_size, lr=cfg.refine.lr, scaling=cfg.refine.lr_scaling or cfg.lr_scaling
+    ) if refine_lr_on else 0.0
+    refine_min_lr = cfg.refine.min_lr or cfg.min_lr
+    refine_end_steps_lr = cfg.refine.end_steps_lr or cfg.end_steps_lr
+    refine_lr_warmup_steps = cfg.refine.lr_warmup_steps or cfg.lr_warmup_steps
 
+    opt_g = build_opt_g(vqgan, base_lr, refine_base_lr)
+    opt_d = torch.optim.Adam(discriminator.parameters(), lr=base_lr, betas=(0.5, 0.9))
+    if refine_lr_on and is_main:
+        console.print(
+            f"[bold]refine lr[/bold] {refine_base_lr:.2e} — {cfg.refine.lr:.2e} scaled by "
+            f"{cfg.refine.lr_scaling or cfg.lr_scaling}, warming up over "
+            f"{refine_lr_warmup_steps:,} images then decaying to {refine_min_lr:.2e} at "
+            f"{refine_end_steps_lr:,.0f}, on its own curve from the generator's"
+        )
+
+    # opt_g is the only thing --vqgan-checkpoint cannot carry over: Adam's
+    # state is per-parameter, and attaching a head changes which parameters the
+    # generator has. opt_d is untouched by that — the refinement head is on the
+    # generator side, PatchDiscriminator's shape is identical either way, and
+    # the discriminator trains every step whatever train_stage says — so
+    # resetting it would only throw away a trained adversary for no reason.
     if resume_ckpt is not None:
-        if "opt_g" in resume_ckpt:
-            opt_g.load_state_dict(resume_ckpt["opt_g"])
+        if "opt_g" in resume_ckpt and not backbone_only:
+            try:
+                opt_g.load_state_dict(resume_ckpt["opt_g"])
+            except ValueError as e:
+                # --refine-train-stage and --refine-lr decide which parameters
+                # go into opt_g and how they are grouped, and neither is stored
+                # in the checkpoint — they describe a run, not its weights. So
+                # a resume that changes either finds Adam's saved moments laid
+                # out for a different optimizer, and says so in terms of the
+                # flag that caused it rather than of param group sizes.
+                saved = [len(g["params"]) for g in resume_ckpt["opt_g"]["param_groups"]]
+                now = [len(g["params"]) for g in opt_g.param_groups]
+                raise ValueError(
+                    f"{cfg.resume} saved its generator optimizer over a different set of "
+                    f"parameters than this run trains (param groups {saved} in the "
+                    f"checkpoint, {now} here): {e}\n"
+                    f"--refine-train-stage and --refine-lr are properties of a run and are "
+                    f"not stored in the checkpoint, so a resume has to be given the same "
+                    f"ones the checkpoint was written under (this run: "
+                    f"train_stage={train_stage}, refine_lr={cfg.refine.lr}). Or pass "
+                    f"--vqgan-checkpoint instead of --resume to keep the weights and start "
+                    f"the generator optimizer fresh."
+                ) from e
+        # Its saved param_groups carry the lr it left off at, which for a run
+        # starting again at image 0 is a decayed one — the cosine schedule
+        # overwrites both optimizers' rates on every step below, so it never
+        # gets used.
         if "opt_d" in resume_ckpt:
             opt_d.load_state_dict(resume_ckpt["opt_d"])
 
@@ -415,7 +704,7 @@ def main(argv=None):
                 f"[yellow]tensorboard CLI not found on PATH[/yellow] — logs are still written to {tb_log_dir}"
             )
 
-    vqgan.train()
+    set_train_mode(vqgan, train_stage)
     discriminator.train()
     running = {}
     running_n = 0
@@ -436,20 +725,42 @@ def main(argv=None):
         # branch of the quantizer stay matched across ranks.
         if not ema_switched and images_seen >= cfg.ema_warmup_steps:
             unwrap(vqgan).quantizer.set_use_ema(True)
-            opt_g = torch.optim.Adam(
-                filter(lambda p: p.requires_grad, vqgan.parameters()), lr=base_lr, betas=(0.5, 0.9)
-            )
+            opt_g = build_opt_g(vqgan, base_lr, refine_base_lr)
             ema_switched = True
             if is_main:
                 console.print(
                     f"{images_seen:,} images: [bold cyan]switched quantizer to EMA mode[/bold cyan]"
                 )
 
+        # The head has had its solo run; let the backbone move again. Same
+        # shape as the EMA switch above — a threshold in images, an optimizer
+        # rebuilt around the parameter set that just changed, and a line in the
+        # log saying where it happened. Every rank crosses it at the same
+        # images_seen, so the freezing stays consistent across ranks.
+        if (train_stage == "refine_only" and cfg.refine.warmup_steps > 0
+                and images_seen >= cfg.refine.warmup_steps):
+            train_stage = "joint"
+            apply_train_stage(vqgan, train_stage, ema_on=ema_switched)
+            opt_g = build_opt_g(vqgan, base_lr, refine_base_lr)
+            set_train_mode(vqgan, train_stage)
+            if is_main:
+                console.print(
+                    f"{images_seen:,} images: [bold cyan]unfroze the backbone[/bold cyan] "
+                    f"(refine_only -> joint)"
+                )
+
         images = images.to(device, non_blocking=True)
 
         lr = cosine_lr(images_seen, cfg.end_steps_lr, base_lr, cfg.min_lr, cfg.lr_warmup_steps)
+        # Same counter, its own curve: ramp, decay and floor all come from the
+        # head's own fields (see RefineConfig).
+        refine_lr = cosine_lr(
+            images_seen, refine_end_steps_lr, refine_base_lr, refine_min_lr,
+            refine_lr_warmup_steps,
+        ) if refine_lr_on else lr
         for group in opt_g.param_groups:
-            group["lr"] = lr
+            # Only a run with its own refine rate has more than one group here.
+            group["lr"] = refine_lr if group.get("refine_group") else lr
         for group in opt_d.param_groups:
             group["lr"] = lr
 
@@ -503,7 +814,7 @@ def main(argv=None):
         if is_main and crossed(previous_images, images_seen, cfg.eval_every_steps):
             evaluate(unwrap(vqgan), eval_val_crops, device, out_dir, images_seen,
                      preview_images, tb_writer, cfg.batch_size, amp, display)
-            vqgan.train()
+            set_train_mode(vqgan, train_stage)
 
         if is_main and crossed(previous_images, images_seen, cfg.checkpoint_every_steps):
             save_checkpoint(vqgan, discriminator, opt_g, opt_d, model_config,

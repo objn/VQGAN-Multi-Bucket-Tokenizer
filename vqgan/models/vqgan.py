@@ -42,6 +42,9 @@ class VQGAN(nn.Module):
         code_dim,
         num_embeddings,
         use_ema=True,
+        refine_enabled=False,
+        refine_hidden_channels=64,
+        refine_num_blocks=2,
     ):
         super().__init__()
         tower = dict(
@@ -57,7 +60,16 @@ class VQGAN(nn.Module):
         self.quantizer = VectorQuantizer(
             num_embeddings=num_embeddings, embedding_dim=code_dim, use_ema=use_ema
         )
-        self.decoder = Decoder(**tower)
+        # Decoder-only: the refinement head runs after unpatchify, so there is
+        # no mirror of it on the encoder side. Defaulted off and accepted as
+        # plain kwargs so a checkpoint written before the head existed loads
+        # with VQGAN(**ckpt["model_config"]) unchanged.
+        self.decoder = Decoder(
+            **tower,
+            refine_enabled=refine_enabled,
+            refine_hidden_channels=refine_hidden_channels,
+            refine_num_blocks=refine_num_blocks,
+        )
 
     def forward(self, x):
         z = self.encoder(x)

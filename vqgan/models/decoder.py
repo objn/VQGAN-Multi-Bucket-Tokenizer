@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+from .refinement import RefinementHead
 from .transformer import TransformerBlock
 
 
@@ -30,6 +31,9 @@ class Decoder(nn.Module):
         mlp_ratio,
         code_dim,
         out_channels=3,
+        refine_enabled=False,
+        refine_hidden_channels=64,
+        refine_num_blocks=2,
     ):
         super().__init__()
         if image_size % patch_size != 0:
@@ -49,6 +53,20 @@ class Decoder(nn.Module):
         # 2 * out_channels: mu and log_b for every pixel of the patch.
         self.to_pixels = nn.Linear(model_dim, patch_size * patch_size * out_channels * 2)
 
+        # Optional, and off by default so an existing checkpoint keeps exactly
+        # the architecture it was trained with. Sees mu and log_b together
+        # (2 * out_channels), after they have been laid back out as an image —
+        # which is the only place the patch seams exist to be smoothed.
+        self.refine = (
+            RefinementHead(
+                2 * out_channels,
+                hidden=refine_hidden_channels,
+                num_blocks=refine_num_blocks,
+            )
+            if refine_enabled
+            else None
+        )
+
     def forward(self, z_q):
         b, _, gh, gw = z_q.shape
         x = z_q.flatten(2).transpose(1, 2)            # [B, N, code_dim]
@@ -64,6 +82,11 @@ class Decoder(nn.Module):
         x = x.permute(0, 5, 1, 3, 2, 4)               # [B, 2C, gh, p, gw, p]
         x = x.reshape(b, 2 * c, gh * p, gw * p)
 
+        # x is exactly cat([mu, log_b], dim=1) at this point, so the head gets
+        # both halves in one pass; it stays an identity until trained.
+        if self.refine is not None:
+            x = self.refine(x)
+
         mu, log_b = x.chunk(2, dim=1)
         recon = 2 * torch.sigmoid(mu) - 1             # [-1, 1], same range as the input
         return recon, mu, log_b
@@ -72,5 +95,15 @@ class Decoder(nn.Module):
         """The final layer's weight, for the adaptive discriminator-weight
         trick (see train_step.py) — the VQGAN/ViT-VQGAN papers balance the
         reconstruction and adversarial losses by comparing how hard *this one
-        layer* is pushed by each, rather than fixing their ratio by hand."""
+        layer* is pushed by each, rather than fixing their ratio by hand.
+
+        The measuring point stays at `to_pixels` in every mode that trains it,
+        so the adaptive weight remains comparable with every run so far. It
+        moves only when `to_pixels` is frozen (refine-only training, see
+        VQGANTrainConfig.refine.train_stage): the ratio is a quotient of two
+        gradients taken at this tensor, and a frozen one has none to take.
+        The refinement head's output convolution is then the last trained
+        layer, and so the equivalent place to measure."""
+        if self.refine is not None and not self.to_pixels.weight.requires_grad:
+            return self.refine.last_layer()
         return self.to_pixels.weight
