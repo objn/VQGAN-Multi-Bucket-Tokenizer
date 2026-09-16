@@ -48,21 +48,31 @@ class _RateColumn(ProgressColumn):
 
 
 class TrainingDisplay:
-    """Three fixed rows that redraw in place, instead of one growing line.
+    """Four fixed rows that redraw in place, instead of one growing line.
 
     The training loop reports ten-odd numbers; as a single tqdm postfix they
     ran past the width of a tmux pane, and a bar that cannot fit its line
     stops overwriting and starts scrolling, which buries the run's actual log
     (eval results, EMA switch, checkpoints) in redrawn duplicates.
 
-    So: progress on its own row, losses on a second, codebook health on a
-    third, each updated on its own cadence and re-measured against the
-    terminal width on every refresh — a resized pane re-wraps instead of
-    smearing.
+    So: progress on its own row, losses on a second, learning rates on a
+    third, codebook health on a fourth, each updated on its own cadence and
+    re-measured against the terminal width on every refresh — a resized pane
+    re-wraps instead of smearing.
 
         train  27% ---------------- 902,852/3,400,000   72.5 img/s eta 9:33:41
         loss   recon 0.0321  laplace -1.9477  lpips 0.3510  vq 0.0007  d_w 9.31
+        rate   vq 7.07e-06 @ 1,400,004 img   head 1.21e-06 @ 400 img
         code   14,203/16,384 used (86.7%)  perplexity 9,842/16,384 (60.1%)
+
+    The rates get a row of their own rather than a couple more entries on the
+    loss row because they are not measured against the same thing. The bar
+    counts the run; each rate is a position on its own schedule, read against
+    its own image count — under refine_only the backbone's clock is standing
+    still while the head's advances — so a rate printed without the count it
+    was read at is a number no one can check. On the loss row there was
+    nowhere to put those counts, and the bar's single position would have been
+    read as belonging to both.
 
     Permanent log lines still go through `console.print` as before: rich's
     Live moves this block down and prints above it, so the history stays
@@ -79,6 +89,7 @@ class TrainingDisplay:
         self.completed = initial_images
         self.live_enabled = console.is_terminal
         self._loss_row = Text("loss   waiting for the first interval...", style="dim")
+        self._rate_row = Text("rate   waiting for the first interval...", style="dim")
         self._code_row = Text("code   waiting for the first eval...", style="dim")
         self._started_at = time.monotonic()
         self._started_from = initial_images
@@ -101,7 +112,7 @@ class TrainingDisplay:
         ) if self.live_enabled else None
 
     def _render(self):
-        return Group(self._progress, self._loss_row, self._code_row)
+        return Group(self._progress, self._loss_row, self._rate_row, self._code_row)
 
     def start(self):
         if self._live is not None:
@@ -125,15 +136,31 @@ class TrainingDisplay:
         self.completed += images
         self._progress.advance(self._task, images)
 
-    def set_losses(self, logs: dict, lr: float):
+    def set_losses(self, logs: dict, rates=()):
+        """Update the loss row, and the rate row from `rates`.
+
+        `rates` is a sequence of (label, lr, images_seen) — one entry per half
+        of the model that is actually training, each carrying the image count
+        its rate was read against. Pass only the halves with gradients: a
+        learning rate belonging to frozen parameters is worse than no number
+        at all, because it is exactly the number a reader watches to decide
+        whether the schedule is working, and under refine_only the generator's
+        rate goes on decaying beside a head that is the only thing training.
+        """
         parts = []
         for key, label, places in _LOSS_FIELDS:
             value = logs.get(key)
             if value is None:  # lpips is None when it is switched off
                 continue
             parts.append(f"{label} {value:.{places}f}")
-        parts.append(f"lr {lr:.2e}")
         body = "  ".join(parts)
+
+        # Each rate with its own clock: these are positions on two different
+        # schedules and there is no single image count that describes both.
+        rate_body = "   ".join(
+            f"{label} {lr:.2e} @ {seen:,} img" for label, lr, seen in rates
+        ) or "-"
+        self._rate_row = Text.from_markup(f"[bold]rate[/bold]   {rate_body}")
 
         if self.live_enabled:
             self._loss_row = Text.from_markup(f"[bold]loss[/bold]   {body}")
@@ -149,7 +176,7 @@ class TrainingDisplay:
             # makes the file harder to read and to grep than no wrapping at all.
             console.print(
                 f"[{self.completed:,}/{self.total_images:,} {pct:5.1f}% "
-                f"{rate:,.1f} img/s] {body}",
+                f"{rate:,.1f} img/s] {body}  |  {rate_body}",
                 soft_wrap=True,
             )
 

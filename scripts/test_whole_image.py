@@ -29,6 +29,7 @@ from torchvision.utils import save_image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from vqgan.checkpoints import default_checkpoint
 from vqgan.config import DataConfig, VQGANTrainConfig
 from vqgan.data import WholeImageDataset, build_shards, collate_single
 from vqgan.display import console, tqdm
@@ -55,7 +56,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--index-path", default=data_defaults.index_path)
     parser.add_argument(
-        "--vqgan-checkpoint", default=str(Path(train_defaults.checkpoint_dir) / "vqgan_last.pt")
+        "--vqgan-checkpoint", default=default_checkpoint(train_defaults.checkpoint_dir)
     )
     parser.add_argument("--split", default="test", choices=("validation", "test"))
     parser.add_argument(

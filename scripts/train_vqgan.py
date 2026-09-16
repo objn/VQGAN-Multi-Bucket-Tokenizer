@@ -10,9 +10,14 @@ gets there faster.
 Usage:
     python scripts/train_vqgan.py --max-steps 1600000
     python scripts/train_vqgan.py --batch-size 128         # schedule unchanged, just faster
-    python scripts/train_vqgan.py --resume checkpoints/vqgan_last.pt
+    python scripts/train_vqgan.py --resume checkpoints/vqgan_step0028582.pt
 
-    # attach a refinement head to a trained backbone and train it alone
+    # add a refinement head to the model and train it alone, keeping the image
+    # count and the schedule the checkpoint arrived with
+    python scripts/train_vqgan.py --resume checkpoints/vqgan_step0028582.pt \
+        --refine-enabled true --refine-train-stage refine_only
+
+    # the same head, but on a new run whose schedule restarts at image 0
     python scripts/train_vqgan.py --vqgan-checkpoint checkpoints/vqgan_step0028582.pt \
         --refine-enabled true --refine-train-stage refine_only
 """
@@ -152,6 +157,13 @@ def parse_args(argv=None):
             f"--refine-train-stage must be one of {', '.join(RefineConfig.STAGES)}, "
             f"got {cfg.refine.train_stage!r}"
         )
+    # Checked here rather than left to scaled_lr(), which would not raise until
+    # the run is already several seconds into building a model.
+    if cfg.refine.lr_scaling not in ("sqrt", "linear", "none"):
+        parser.error(
+            f"--refine-lr-scaling must be sqrt, linear or none, got "
+            f"{cfg.refine.lr_scaling!r}"
+        )
     return cfg, reset_discriminator, vqgan_checkpoint
 
 
@@ -245,7 +257,7 @@ def set_train_mode(vqgan, stage: str):
 
 
 def build_opt_g(vqgan, base_lr: float, refine_lr: float):
-    """The generator's Adam, over whatever is trainable at the moment.
+    """The generator's Adam, over every generator parameter.
 
     betas are a momentum window measured in steps, so unlike everything else
     here they do shift with batch size. Left fixed: (0.5, 0.9) is the pairing
@@ -253,24 +265,122 @@ def build_opt_g(vqgan, base_lr: float, refine_lr: float):
     way the codebook EMA does would leave essentially no momentum at all at
     large batches (0.5 ** 16 is 1.5e-5).
 
-    With `refine_lr` above 0 the head gets its own param group, tagged
-    `refine_group` so the training loop can drive it with the head's own
-    schedule (RefineConfig.lr and the three fields under it) instead of the
-    generator's: a head attached to a backbone millions of images into its
-    decay would otherwise be born at whatever near-min_lr rate that schedule
-    has reached. `refine_lr` is the already-scaled rate — see
-    VQGANTrainConfig.scaled_lr.
+    Two param groups, always, and the same parameters in each whatever
+    train_stage is: the head, tagged `refine_group` so the training loop can
+    drive it from RefineConfig's schedule, and the rest of the generator on
+    its own. They are two independent schedules over two clocks — see
+    RefineConfig. `refine_lr` is the head's already-scaled rate (see
+    VQGANTrainConfig.scaled_lr).
+
+    Note what is *not* filtered here: parameters a stage has frozen go in
+    anyway. Adam skips any parameter whose `.grad` is None, so a frozen one is
+    held without being stepped and without so much as an exp_avg allocated for
+    it — freezing is enforced by requires_grad, not by optimizer membership,
+    and the two say the same thing.
+
+    Handing it the frozen ones buys a stable layout. Adam's state is keyed by
+    each parameter's *position* in these groups, so filtering made the key
+    space a function of train_stage: index 0 was the encoder's position
+    embedding in a joint run and the head's first convolution in a refine_only
+    one, and a saved optimizer could not be read back by a run in a different
+    stage — a resume across stages failed, and a refine_only run dropped the
+    backbone's moments on the floor rather than carrying them through. With
+    every parameter present the positions mean the same thing in every stage,
+    so the state loads, survives a refine run untouched, and is still there
+    when the backbone starts training again.
+
+    The cost is that Adam walks the frozen parameters each step to skip them.
     """
-    trainable = [(n, p) for n, p in unwrap(vqgan).named_parameters() if p.requires_grad]
-    if refine_lr <= 0:
-        groups = [{"params": [p for _, p in trainable]}]
-    else:
-        head = [p for n, p in trainable if n.startswith(REFINE_PREFIX)]
-        rest = [p for n, p in trainable if not n.startswith(REFINE_PREFIX)]
-        groups = [g for g in ({"params": rest},
-                              {"params": head, "lr": refine_lr, "refine_group": True})
-                  if g["params"]]
+    named = list(unwrap(vqgan).named_parameters())
+    head = [p for n, p in named if n.startswith(REFINE_PREFIX)]
+    rest = [p for n, p in named if not n.startswith(REFINE_PREFIX)]
+    # Empty only when the model has no head at all; Adam rejects an empty
+    # group, and a model without a head has no second schedule to drive.
+    groups = [g for g in ({"params": rest},
+                          {"params": head, "lr": refine_lr, "refine_group": True})
+              if g["params"]]
     return torch.optim.Adam(groups, lr=base_lr, betas=(0.5, 0.9))
+
+
+def flat_named_params(vqgan):
+    """The generator's parameters as (name, param), in build_opt_g's group
+    order — the order Adam numbers its state by."""
+    named = list(unwrap(vqgan).named_parameters())
+    head = [(n, p) for n, p in named if n.startswith(REFINE_PREFIX)]
+    rest = [(n, p) for n, p in named if not n.startswith(REFINE_PREFIX)]
+    return rest + head
+
+
+def _state_fits(state: dict, candidates) -> bool:
+    """Would `state`, read positionally, land a moment of the right shape on
+    every one of `candidates`?"""
+    if any(int(i) >= len(candidates) for i in state):
+        return False
+    return all(
+        state[i]["exp_avg"].shape == candidates[int(i)][1].shape
+        and state[i]["exp_avg_sq"].shape == candidates[int(i)][1].shape
+        for i in state
+    )
+
+
+def adopt_opt_g_state(opt_g, saved: dict, flat) -> bool:
+    """Load `saved` into `opt_g`, re-seating its state onto the right
+    parameters, and return whether that could be done.
+
+    Adam keys its state by each parameter's *position* in the optimizer's
+    groups, and a position is only meaningful next to the list of parameters
+    it was numbered against. Two things move it: adding a head (the group list
+    grows), and — before build_opt_g stopped filtering — a stage or an EMA
+    switch excluding something from the middle. The codebook leaving the
+    optimizer once EMA takes over shifts every parameter after it by one, so
+    reading the state positionally against today's full list would hand a
+    hundred-odd parameters somebody else's moments. Silently: the shapes are
+    wrong, but nothing checks them, and Adam would carry on with moments that
+    describe a different tensor.
+
+    So the state is re-seated by name. Checkpoints written from here on store
+    `param_names` for exactly this, and names are matched to today's
+    positions; anything the file has that this model does not is dropped, and
+    anything new (a freshly attached head) simply starts without state.
+
+    Checkpoints written before that carry no names, and their positions have
+    to be reconstructed. Only the exclusions the old build_opt_g could
+    actually produce are tried — it filtered on requires_grad, so the
+    candidates are "everything" and "everything but the codebook" — and each
+    is accepted only if every saved moment's shape matches the parameter it
+    would land on. A file that fits neither is refused rather than guessed at.
+    """
+    state = {int(i): v for i, v in (saved.get("state") or {}).items()}
+    if not state:
+        return True
+
+    names = saved.get("param_names")
+    if names is not None:
+        position = {n: i for i, (n, _) in enumerate(flat)}
+        remapped = {
+            position[names[i]]: v
+            for i, v in state.items()
+            if i < len(names) and names[i] in position
+        }
+    else:
+        remapped = None
+        for excluded in ((), ("quantizer.codebook.weight",)):
+            candidates = [(n, p) for n, p in flat if n not in excluded]
+            if not _state_fits(state, candidates):
+                continue
+            position = {n: i for i, (n, _) in enumerate(flat)}
+            remapped = {position[candidates[i][0]]: v for i, v in state.items()}
+            break
+        if remapped is None:
+            return False
+
+    # This run's group description, not the file's: it has the head's group,
+    # and the rates on it are overwritten from the schedule every step anyway.
+    opt_g.load_state_dict({
+        "state": remapped,
+        "param_groups": opt_g.state_dict()["param_groups"],
+    })
+    return True
 
 
 def infinite(loader):
@@ -447,6 +557,31 @@ def main(argv=None):
 
     global_step = 0
     images_seen = 0
+    # Three clocks, because "how far along is this run" and "how much training
+    # has this half of the model actually had" stop being the same question the
+    # moment a stage freezes something.
+    #
+    #   images_seen         the run's wall clock — every image pulled from the
+    #                       loader, whatever it was used for. max_steps, the
+    #                       eval/checkpoint/log cadence and the progress bar
+    #                       are all measured on it, and it never stops.
+    #   vq_images_seen      images that moved the backbone. Stands still under
+    #                       refine_only. Drives the VQ lr curve and the EMA
+    #                       switch.
+    #   refine_images_seen  images that moved the refinement head, counted from
+    #                       the moment the head was created. Stands still under
+    #                       vq_only, and is 0 on a model that has no head.
+    #                       Drives the head's lr curve, its discriminator
+    #                       warmup and unfreeze_steps.
+    #
+    # Each schedule then reads the clock of the thing it schedules, so a warmup
+    # measures the age of the parameters it is ramping rather than the age of
+    # the run that happens to contain them.
+    vq_images_seen = 0
+    refine_images_seen = 0
+    # Optimizer steps the head has taken. Not a schedule input — the second
+    # half of the checkpoint filename, the counterpart of global_step.
+    refine_global_step = 0
     ema_switched = False
     resume_ckpt = None
 
@@ -488,6 +623,13 @@ def main(argv=None):
             f"{cfg.tile_size}; the learned position embeddings are tied to the token grid"
         )
 
+    # Whether this run's model has a refinement head — settled the moment
+    # model_config is, and asked often enough below (the budget, the clocks,
+    # the readout, the filename) to be worth a name rather than a dict lookup
+    # each time. Note it is a property of the model, not of train_stage: a
+    # vq_only run on a model with a head still has one.
+    head_present = model_config["refine_enabled"]
+
     # Start with gradient-based codebook updates; switch to EMA after
     # ema_warmup_steps once the encoder has stabilized (EMA from image 0 can
     # lock in a noisy initial encoder).
@@ -497,6 +639,10 @@ def main(argv=None):
     n_params = sum(p.numel() for p in vqgan.parameters())
     if is_main:
         console.print(f"generator: {n_params / 1e6:.1f}M params, token grid {grid_size}x{grid_size}")
+
+    # Set by the block below, and read again when the generator optimizer is
+    # restored: attaching a head is the one resume that cannot carry opt_g over.
+    attaching_refine = False
 
     if resume_ckpt is not None:
         # A head this run is attaching for the first time is the one thing
@@ -570,11 +716,30 @@ def main(argv=None):
             images_seen = resume_ckpt.get(
                 "images_seen", global_step * cfg.reference_batch_size
             )
+            # Checkpoints written before the clocks were split carry only
+            # images_seen, and for them it is the right answer for the backbone:
+            # nothing could freeze it, so every image it saw trained it.
+            vq_images_seen = resume_ckpt.get("vq_images_seen", images_seen)
+            # The head's clock, on the other hand, is 0 unless the file already
+            # had a head — and if it had one without recording its age, that
+            # head was trained by a run whose whole image count went to it.
+            if attaching_refine or not head_present:
+                refine_images_seen = 0
+                refine_global_step = 0
+            else:
+                refine_images_seen = resume_ckpt.get("refine_images_seen", images_seen)
+                refine_global_step = resume_ckpt.get("refine_global_step", global_step)
             if is_main:
                 console.print(
                     f"resumed from {cfg.resume} at {images_seen:,} images / step {global_step} "
                     f"(ema_switched={ema_switched})"
                 )
+                if head_present:
+                    console.print(
+                        f"[bold]clocks[/bold] backbone {vq_images_seen:,} images, head "
+                        f"{refine_images_seen:,} images"
+                        f"{' (new — its schedule starts here)' if attaching_refine else ''}"
+                    )
 
     # Which half of the model trains. Applied before DDP wraps the model, since
     # DDP reads requires_grad when it builds its reducer, and before opt_g,
@@ -583,8 +748,9 @@ def main(argv=None):
     if train_stage == "refine_only" and not model_config["refine_enabled"]:
         raise ValueError(
             "--refine-train-stage refine_only has nothing to train: this run has no "
-            "refinement head. Pass --refine-enabled true, with --vqgan-checkpoint <file> to "
-            "attach one to an already-trained backbone."
+            "refinement head. Pass --refine-enabled true to attach one — with --resume "
+            "<file> to add it to the model and keep its image count, or with "
+            "--vqgan-checkpoint <file> to take the weights alone and start a new run."
         )
     if train_stage != "joint":
         apply_train_stage(vqgan, train_stage, ema_on=ema_switched)
@@ -594,10 +760,10 @@ def main(argv=None):
                 f"[bold]train stage[/bold] {train_stage} — {trainable / 1e6:.2f}M of "
                 f"{n_params / 1e6:.1f}M generator params training"
             )
-    if cfg.refine.warmup_steps > 0 and train_stage == "refine_only" and is_main:
+    if cfg.refine.unfreeze_steps > 0 and train_stage == "refine_only" and is_main:
         console.print(
-            f"[bold]refine warmup[/bold] backbone unfreezes at "
-            f"{cfg.refine.warmup_steps:,} images (refine_only -> joint)"
+            f"[bold]refine unfreeze[/bold] backbone unfreezes once the head has had "
+            f"{cfg.refine.unfreeze_steps:,} images (refine_only -> joint)"
         )
 
     # DDP averages gradients across ranks, so the batch this rate is being
@@ -618,6 +784,17 @@ def main(argv=None):
                else "lr never reaches min_lr within this run")
         )
 
+    if head_present and cfg.refine.end_steps_lr != cfg.refine.max_steps and is_main:
+        where = "before" if cfg.refine.end_steps_lr < cfg.refine.max_steps else "past"
+        console.print(
+            f"[bold]refine lr decay[/bold] reaches min_lr at "
+            f"{cfg.refine.end_steps_lr:,.0f} head images, {where} the head's budget "
+            f"({cfg.refine.max_steps:,}) — "
+            + ("its rate sits flat at min_lr for the rest of the run"
+               if cfg.refine.end_steps_lr < cfg.refine.max_steps
+               else "its rate never reaches min_lr, so the run ends mid-decay")
+        )
+
     # Wrapped after any resume has been loaded, so DDP's constructor broadcasts
     # the resumed weights to every rank rather than a fresh random init.
     # broadcast_buffers=False because the one buffer set that has to agree
@@ -632,58 +809,84 @@ def main(argv=None):
             discriminator, device_ids=[local_rank], broadcast_buffers=False
         )
 
-    # The head's schedule, resolved once here rather than per step. Each field
-    # reads 0/"" as "whatever the VQ side does" (see RefineConfig), which is
-    # what `or` is spelling out below; with refine.lr itself at 0 none of it is
-    # used at all and the head rides base_lr in the single param group.
-    refine_lr_on = cfg.refine.lr > 0
+    # Which config the loss, adversarial and eval settings come from. A model
+    # with a refinement head is trained by RefineConfig's copies of them and a
+    # model without one by VQGANTrainConfig's — the field names match exactly,
+    # so the choice is this one binding rather than a fallback at each use.
+    # Nothing is merged: picking a side picks all of it.
+    knobs = cfg.refine if head_present else cfg
+
+    # The head's rate, scaled once here the way base_lr was. Everything else
+    # about its curve is read straight off cfg.refine at each step: none of it
+    # falls back to the VQ schedule (see RefineConfig).
     refine_base_lr = cfg.scaled_lr(
-        world_size, lr=cfg.refine.lr, scaling=cfg.refine.lr_scaling or cfg.lr_scaling
-    ) if refine_lr_on else 0.0
-    refine_min_lr = cfg.refine.min_lr or cfg.min_lr
-    refine_end_steps_lr = cfg.refine.end_steps_lr or cfg.end_steps_lr
-    refine_lr_warmup_steps = cfg.refine.lr_warmup_steps or cfg.lr_warmup_steps
+        world_size, lr=cfg.refine.lr, scaling=cfg.refine.lr_scaling
+    )
 
     opt_g = build_opt_g(vqgan, base_lr, refine_base_lr)
+    # The same order build_opt_g put them in, so position i in opt_g's state is
+    # opt_g_flat[i]. The names go into every checkpoint and the pairs are what
+    # re-seats a resumed one — see adopt_opt_g_state.
+    opt_g_flat = flat_named_params(vqgan)
+    opt_g_names = [n for n, _ in opt_g_flat]
     opt_d = torch.optim.Adam(discriminator.parameters(), lr=base_lr, betas=(0.5, 0.9))
-    if refine_lr_on and is_main:
+    if head_present and is_main:
         console.print(
             f"[bold]refine lr[/bold] {refine_base_lr:.2e} — {cfg.refine.lr:.2e} scaled by "
-            f"{cfg.refine.lr_scaling or cfg.lr_scaling}, warming up over "
-            f"{refine_lr_warmup_steps:,} images then decaying to {refine_min_lr:.2e} at "
-            f"{refine_end_steps_lr:,.0f}, on its own curve from the generator's"
+            f"{cfg.refine.lr_scaling}, warming up over {cfg.refine.lr_warmup_steps:,} images "
+            f"then decaying to {cfg.refine.min_lr:.2e} at {cfg.refine.end_steps_lr:,.0f} — "
+            f"its own curve, unaffected by --lr and the rest of the VQ schedule"
+        )
+        # Spelled out because these are the --refine-* values, not the plain
+        # ones: a --disc-weight or --lpips-weight passed to this run was read
+        # into a config it is not training from.
+        console.print(
+            f"[bold]refine losses[/bold] l2 {knobs.l2_weight} laplace "
+            f"{knobs.logit_laplace_weight} lpips {knobs.lpips_weight}"
+            f"{'' if knobs.use_lpips else ' (off)'}, disc {knobs.disc_weight} after "
+            f"{knobs.disc_warmup_steps:,} images, clip {knobs.grad_clip_norm}, eval every "
+            f"{knobs.eval_every_steps:,}"
         )
 
-    # opt_g is the only thing --vqgan-checkpoint cannot carry over: Adam's
-    # state is per-parameter, and attaching a head changes which parameters the
-    # generator has. opt_d is untouched by that — the refinement head is on the
+    # opt_g comes across on any --resume now, whatever stage either side was in.
+    # build_opt_g holds every generator parameter rather than only the unfrozen
+    # ones, so Adam's positional state keys mean the same thing in every stage:
+    # a refine_only run loads the backbone's moments, leaves them untouched for
+    # the length of the run (a frozen parameter is never stepped) and writes
+    # them back out. They are still there when the backbone trains again, and
+    # every checkpoint is the same size rather than shrinking to the third of
+    # itself that a refine run happens to be using.
+    #
+    # Attaching a head is the one case where the *layout* changes — one group
+    # becomes two — and adopt_opt_g_state() handles it by keeping the state and
+    # taking this run's group description.
+    #
+    # --vqgan-checkpoint still starts fresh, by definition: it takes weights
+    # alone and begins a new run around them.
+    #
+    # opt_d is untouched by any of this — the refinement head is on the
     # generator side, PatchDiscriminator's shape is identical either way, and
     # the discriminator trains every step whatever train_stage says — so
     # resetting it would only throw away a trained adversary for no reason.
     if resume_ckpt is not None:
         if "opt_g" in resume_ckpt and not backbone_only:
-            try:
-                opt_g.load_state_dict(resume_ckpt["opt_g"])
-            except ValueError as e:
-                # --refine-train-stage and --refine-lr decide which parameters
-                # go into opt_g and how they are grouped, and neither is stored
-                # in the checkpoint — they describe a run, not its weights. So
-                # a resume that changes either finds Adam's saved moments laid
-                # out for a different optimizer, and says so in terms of the
-                # flag that caused it rather than of param group sizes.
+            if adopt_opt_g_state(opt_g, resume_ckpt["opt_g"], opt_g_flat):
+                if attaching_refine and is_main:
+                    console.print(
+                        "[yellow]refine:[/yellow] the backbone's optimizer state came "
+                        "across unchanged; the head starts with none of its own"
+                    )
+            else:
                 saved = [len(g["params"]) for g in resume_ckpt["opt_g"]["param_groups"]]
                 now = [len(g["params"]) for g in opt_g.param_groups]
                 raise ValueError(
-                    f"{cfg.resume} saved its generator optimizer over a different set of "
-                    f"parameters than this run trains (param groups {saved} in the "
-                    f"checkpoint, {now} here): {e}\n"
-                    f"--refine-train-stage and --refine-lr are properties of a run and are "
-                    f"not stored in the checkpoint, so a resume has to be given the same "
-                    f"ones the checkpoint was written under (this run: "
-                    f"train_stage={train_stage}, refine_lr={cfg.refine.lr}). Or pass "
-                    f"--vqgan-checkpoint instead of --resume to keep the weights and start "
-                    f"the generator optimizer fresh."
-                ) from e
+                    f"{cfg.resume} holds a generator optimizer whose state cannot be "
+                    f"matched to this model's parameters (param groups {saved} in the "
+                    f"checkpoint, {now} here, and no param_names to go by). A stage or "
+                    f"EMA difference is carried across; this is a checkpoint from a "
+                    f"different architecture. Pass --vqgan-checkpoint instead of "
+                    f"--resume to keep the weights and start the optimizer fresh."
+                )
         # Its saved param_groups carry the lr it left off at, which for a run
         # starting again at image 0 is a decayed one — the cosine schedule
         # overwrites both optimizers' rates on every step below, so it never
@@ -711,21 +914,60 @@ def main(argv=None):
     # Progress, logging and every trigger below are counted in images. Steps
     # are still counted, but only to name checkpoints and to average the
     # running loss over the batches that produced it.
-    display = TrainingDisplay(total_images=cfg.max_steps, initial_images=images_seen) \
+    # The bar tracks the budget that will actually end the run, on that
+    # budget's own clock. A refine_only run drawn against the VQ pair would
+    # open at "1,400,004/3,400,000 — 41%" and finish at 43%, describing a
+    # backbone that never moves, while the thing being trained went from 0
+    # to done.
+    if train_stage == "refine_only":
+        bar_total, bar_start = cfg.refine.max_steps, refine_images_seen
+    else:
+        bar_total, bar_start = cfg.max_steps, vq_images_seen
+    display = TrainingDisplay(total_images=bar_total, initial_images=bar_start) \
         if is_main else None
     if display is not None:
         display.start()
 
+    # The step number already represented on disk for this model: whatever a
+    # --resume arrived at, or nothing at all for a fresh run. The save at the
+    # end of the run compares against it, so a run that does no steps — a
+    # --resume of a checkpoint already at max_steps, which breaks out of the
+    # loop immediately — writes nothing rather than rewriting the very file it
+    # was started from under a fresh optimizer.
+    last_saved_step = global_step
+
     for images in infinite(train_loader):
-        if images_seen >= cfg.max_steps:
+        # Each budget against its own clock. The backbone's is an absolute
+        # position it has been walking towards since image 0; the head's is a
+        # length, counted from the moment it was created. Neither is measured
+        # on images_seen, which counts work done rather than progress along
+        # either schedule — a refine_only run pushes it forward while the
+        # backbone's position does not move at all.
+        #
+        # Whichever is spent first ends the run. Under refine_only only the
+        # head's can be, since vq_images_seen is standing still, which is what
+        # makes cfg.refine.max_steps the length of a refine run.
+        if vq_images_seen >= cfg.max_steps:
+            break
+        if head_present and refine_images_seen >= cfg.refine.max_steps:
             break
 
         # Every rank flips at the same images_seen (the counter advances by the
         # same global amount everywhere), so the collectives inside the EMA
         # branch of the quantizer stay matched across ranks.
-        if not ema_switched and images_seen >= cfg.ema_warmup_steps:
+        # The backbone's clock, not the run's: the warmup exists to let the
+        # encoder stabilize before the codebook starts following it, and a
+        # refine_only stretch stabilizes nothing — the encoder is frozen and
+        # the quantizer is in eval mode throughout.
+        #
+        # No optimizer rebuild here. set_use_ema() clears the codebook's
+        # requires_grad so that EMA is the only thing writing it, and since
+        # build_opt_g holds every parameter regardless, Adam simply stops
+        # stepping one it is still holding. Rebuilding used to be what took the
+        # codebook out of the optimizer, and it threw away every other
+        # parameter's moments to do it.
+        if not ema_switched and vq_images_seen >= cfg.ema_warmup_steps:
             unwrap(vqgan).quantizer.set_use_ema(True)
-            opt_g = build_opt_g(vqgan, base_lr, refine_base_lr)
             ema_switched = True
             if is_main:
                 console.print(
@@ -733,31 +975,40 @@ def main(argv=None):
                 )
 
         # The head has had its solo run; let the backbone move again. Same
-        # shape as the EMA switch above — a threshold in images, an optimizer
-        # rebuilt around the parameter set that just changed, and a line in the
-        # log saying where it happened. Every rank crosses it at the same
-        # images_seen, so the freezing stays consistent across ranks.
-        if (train_stage == "refine_only" and cfg.refine.warmup_steps > 0
-                and images_seen >= cfg.refine.warmup_steps):
+        # shape as the EMA switch above — a threshold in images and a line in
+        # the log saying where it happened. Every rank crosses it at the same
+        # refine_images_seen, so the freezing stays consistent across ranks.
+        #
+        # And as there, no optimizer rebuild: opt_g already holds the backbone,
+        # so clearing requires_grad is the whole of it. The backbone picks its
+        # moments up where the last run that trained it left off, and the head
+        # keeps its own across the switch instead of being reset at the exact
+        # moment it stops being the only thing training.
+        if (train_stage == "refine_only" and cfg.refine.unfreeze_steps > 0
+                and refine_images_seen >= cfg.refine.unfreeze_steps):
             train_stage = "joint"
             apply_train_stage(vqgan, train_stage, ema_on=ema_switched)
-            opt_g = build_opt_g(vqgan, base_lr, refine_base_lr)
             set_train_mode(vqgan, train_stage)
             if is_main:
                 console.print(
-                    f"{images_seen:,} images: [bold cyan]unfroze the backbone[/bold cyan] "
-                    f"(refine_only -> joint)"
+                    f"{refine_images_seen:,} head images: [bold cyan]unfroze the "
+                    f"backbone[/bold cyan] (refine_only -> joint)"
                 )
 
         images = images.to(device, non_blocking=True)
 
-        lr = cosine_lr(images_seen, cfg.end_steps_lr, base_lr, cfg.min_lr, cfg.lr_warmup_steps)
-        # Same counter, its own curve: ramp, decay and floor all come from the
-        # head's own fields (see RefineConfig).
+        lr = cosine_lr(
+            vq_images_seen, cfg.end_steps_lr, base_lr, cfg.min_lr, cfg.lr_warmup_steps
+        )
+        # Its own clock as well as its own curve: rate, ramp, decay and floor
+        # all come from the head's own fields, read against the head's own age
+        # (see RefineConfig). This is what makes lr_warmup_steps mean anything
+        # when a head is added to a model millions of images in — the ramp
+        # starts where the head starts, not where the run does.
         refine_lr = cosine_lr(
-            images_seen, refine_end_steps_lr, refine_base_lr, refine_min_lr,
-            refine_lr_warmup_steps,
-        ) if refine_lr_on else lr
+            refine_images_seen, cfg.refine.end_steps_lr, refine_base_lr, cfg.refine.min_lr,
+            cfg.refine.lr_warmup_steps,
+        )
         for group in opt_g.param_groups:
             # Only a run with its own refine rate has more than one group here.
             group["lr"] = refine_lr if group.get("refine_group") else lr
@@ -766,15 +1017,19 @@ def main(argv=None):
 
         logs = train_step(
             vqgan, discriminator, opt_g, opt_d, images,
-            l2_weight=cfg.l2_weight,
-            logit_laplace_weight=cfg.logit_laplace_weight,
-            lpips_weight=cfg.lpips_weight,
-            disc_weight=cfg.disc_weight,
-            use_lpips=cfg.use_lpips,
-            images_seen=images_seen,
-            disc_start_images=cfg.disc_warmup_steps,
+            l2_weight=knobs.l2_weight,
+            logit_laplace_weight=knobs.logit_laplace_weight,
+            lpips_weight=knobs.lpips_weight,
+            disc_weight=knobs.disc_weight,
+            use_lpips=knobs.use_lpips,
+            # Paired with knobs above: a run training a head measures its
+            # discriminator warmup in the head's images, so "let it settle for
+            # 50,000 before it faces the adversary" counts the head's first
+            # 50,000 and not a number the backbone passed long ago.
+            images_seen=refine_images_seen if head_present else vq_images_seen,
+            disc_start_images=knobs.disc_warmup_steps,
             amp=amp,
-            grad_clip_norm=cfg.grad_clip_norm,
+            grad_clip_norm=knobs.grad_clip_norm,
         )
         for k, v in logs.items():
             if v is not None:
@@ -790,40 +1045,91 @@ def main(argv=None):
         # triggers below (and therefore the collectives they lead to) matched.
         step_images = images.shape[0] * world_size
         images_seen += step_images
+        # Each training clock advances only while the half it measures is the
+        # one being trained. train_stage is read fresh every step because the
+        # unfreeze above can change it mid-run.
+        if train_stage != "refine_only":
+            vq_images_seen += step_images
+        if head_present and train_stage != "vq_only":
+            refine_images_seen += step_images
+            refine_global_step += 1
 
         if is_main:
+            # Same amount whichever clock the bar is drawn against: every
+            # step feeds the whole batch to whatever is training, so that
+            # clock advances by step_images exactly as images_seen does.
             display.advance(step_images)
 
         if crossed(previous_images, images_seen, cfg.log_every_steps):
             avg = {k: v / running_n for k, v in running.items()}
             if is_main:
-                display.set_losses(avg, lr)
+                # Report the rate of whatever has gradients this step, and only
+                # that. Under refine_only the generator's rate is still being
+                # computed and still decaying, but it belongs to frozen
+                # parameters — printing it next to the losses invites reading
+                # the wrong curve to decide whether the schedule is working.
+                vq_training = train_stage != "refine_only"
+                head_training = head_present and train_stage != "vq_only"
+                # Each rate travels with the clock it was read against, and
+                # only the halves that have gradients get an entry — see
+                # TrainingDisplay.set_losses.
+                rates = []
+                if vq_training:
+                    rates.append(("vq", lr, vq_images_seen))
+                if head_training:
+                    rates.append(("head", refine_lr, refine_images_seen))
+                display.set_losses(avg, rates)
                 # x-axis in images, not steps, so curves from runs at different
                 # batch sizes lie on top of each other instead of being stretched
                 # apart by a factor of batch.
                 for k, v in avg.items():
                     tb_writer.add_scalar(f"train/{k}", v, images_seen)
-                tb_writer.add_scalar("train/lr", lr, images_seen)
+                if vq_training:
+                    tb_writer.add_scalar("train/lr", lr, images_seen)
+                if head_training:
+                    tb_writer.add_scalar("train/refine_lr", refine_lr, images_seen)
+                # The clocks, so a curve read later can be placed against the
+                # age of the half of the model that produced it rather than
+                # against the run that contained it.
                 tb_writer.add_scalar("train/global_step", global_step, images_seen)
+                tb_writer.add_scalar("train/vq_images_seen", vq_images_seen, images_seen)
+                if head_present:
+                    tb_writer.add_scalar(
+                        "train/refine_images_seen", refine_images_seen, images_seen
+                    )
             running, running_n = {}, 0
 
         # Rank 0 evaluates and writes; the others simply carry on to the next
         # step and block at its gradient all-reduce until rank 0 catches up.
         # evaluate() gets the unwrapped model so nothing touches DDP's
         # per-iteration bookkeeping outside the training step itself.
-        if is_main and crossed(previous_images, images_seen, cfg.eval_every_steps):
+        if is_main and crossed(previous_images, images_seen, knobs.eval_every_steps):
             evaluate(unwrap(vqgan), eval_val_crops, device, out_dir, images_seen,
                      preview_images, tb_writer, cfg.batch_size, amp, display)
             set_train_mode(vqgan, train_stage)
 
         if is_main and crossed(previous_images, images_seen, cfg.checkpoint_every_steps):
             save_checkpoint(vqgan, discriminator, opt_g, opt_d, model_config,
-                            global_step, images_seen, ema_switched, checkpoint_dir)
+                            global_step, images_seen, ema_switched, checkpoint_dir,
+                            vq_images_seen, refine_images_seen, refine_global_step,
+                            opt_g_names)
+            last_saved_step = global_step
 
     if is_main:
         display.stop()
-        save_checkpoint(vqgan, discriminator, opt_g, opt_d, model_config,
-                        global_step, images_seen, ema_switched, checkpoint_dir, tag="last")
+        # The end of the run gets a checkpoint under its own step number, not a
+        # fixed vqgan_last.pt. A fixed name is a file every run overwrites, and
+        # what it overwrites is whatever the run before it spent hours
+        # producing — including, if that name was ever used as a starting
+        # point, this run's own. Numbered files are written once and never
+        # again, and "the newest" is just the highest number on disk
+        # (vqgan.checkpoints.latest_step_checkpoint). Skipped when the periodic
+        # save above already wrote this exact step.
+        if global_step != last_saved_step:
+            save_checkpoint(vqgan, discriminator, opt_g, opt_d, model_config,
+                            global_step, images_seen, ema_switched, checkpoint_dir,
+                            vq_images_seen, refine_images_seen, refine_global_step,
+                            opt_g_names)
         tb_writer.close()
     cleanup_distributed(is_distributed)
 
@@ -902,16 +1208,39 @@ def evaluate(vqgan, eval_val_crops, device, out_dir, images_seen, preview_images
 
 def save_checkpoint(
     vqgan, discriminator, opt_g, opt_d, model_config, global_step, images_seen, ema_switched,
-    checkpoint_dir, tag=None,
+    checkpoint_dir, vq_images_seen, refine_images_seen, refine_global_step,
+    opt_g_names,
 ):
-    name = f"vqgan_{tag}" if tag else f"vqgan_step{global_step:07d}"
+    """Write one checkpoint, named for the steps it holds.
+
+    A model with no head is `vqgan_step0028582.pt`; one with a head is
+    `vqgan_step0028582_refine_step0050000.pt`, the second number being the
+    head's own step count. Both only ever move forward, so a name is claimed
+    once and the file under it is never rewritten — and the name says, without
+    being opened, whether the file has a head and how much training each half
+    of it has had. See vqgan/checkpoints.py for the reading half.
+    """
+    name = f"vqgan_step{global_step:07d}"
+    if model_config["refine_enabled"]:
+        name += f"_refine_step{refine_global_step:07d}"
     path = checkpoint_dir / f"{name}.pt"
+    opt_g_state = opt_g.state_dict()
+    # What Adam's positional state keys refer to. Without it a reader has to
+    # assume the parameter list has not changed shape since — which is exactly
+    # the assumption that breaks across a stage or an EMA switch.
+    opt_g_state["param_names"] = list(opt_g_names)
     ckpt = {
         "global_step": global_step,
         # What the schedule actually runs on. global_step is kept alongside it
         # for the filename and for reading old checkpoints, but two runs at
         # different batch sizes agree on images, not steps.
         "images_seen": images_seen,
+        # The two training clocks (see main). Stored because they cannot be
+        # recovered from images_seen — how much of a run went to each half
+        # depends on the stages it passed through, which nothing else records.
+        "vq_images_seen": vq_images_seen,
+        "refine_images_seen": refine_images_seen,
+        "refine_global_step": refine_global_step,
         "ema_switched": ema_switched,
         "model_config": model_config,
         # unwrap() so a DDP run writes the same plain keys a single-GPU run
@@ -919,7 +1248,7 @@ def save_checkpoint(
         # and no other script in this project knows how to read that.
         "vqgan": unwrap(vqgan).state_dict(),
         "discriminator": unwrap(discriminator).state_dict(),
-        "opt_g": opt_g.state_dict(),
+        "opt_g": opt_g_state,
         "opt_d": opt_d.state_dict(),
     }
     torch.save(ckpt, path)

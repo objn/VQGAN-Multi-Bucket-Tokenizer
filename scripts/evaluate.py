@@ -2,7 +2,7 @@
 and a spot-check grid PNG.
 
 Usage:
-    python scripts/evaluate.py --vqgan-checkpoint checkpoints/vqgan_last.pt
+    python scripts/evaluate.py --vqgan-checkpoint checkpoints/vqgan_step0028582.pt
 """
 
 import argparse
@@ -16,6 +16,7 @@ from torchvision.utils import make_grid, save_image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from vqgan.checkpoints import default_checkpoint
 from vqgan.config import DataConfig, VQGANTrainConfig
 from torch.utils.data import DataLoader
 
@@ -31,7 +32,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--index-path", default=data_defaults.index_path)
     parser.add_argument(
-        "--vqgan-checkpoint", default=str(Path(train_defaults.checkpoint_dir) / "vqgan_last.pt")
+        "--vqgan-checkpoint", default=default_checkpoint(train_defaults.checkpoint_dir)
     )
     parser.add_argument(
         "--split", default="validation", choices=("validation", "test"),

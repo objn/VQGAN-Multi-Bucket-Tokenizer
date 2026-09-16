@@ -3,7 +3,7 @@ param count) printed straight to the console, plus the full model graph
 written to TensorBoard for interactive, expandable node-by-node inspection.
 
 Usage:
-    python scripts/visualize_model.py --vqgan-checkpoint checkpoints/vqgan_last.pt
+    python scripts/visualize_model.py --vqgan-checkpoint checkpoints/vqgan_step0028582.pt
 """
 
 import argparse
@@ -18,6 +18,7 @@ from torchinfo import summary
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from vqgan.checkpoints import default_checkpoint
 from vqgan.config import VQGANTrainConfig
 from vqgan.display import console
 from vqgan.models import VQGAN
@@ -42,7 +43,7 @@ def parse_args(argv=None):
     defaults = VQGANTrainConfig()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--vqgan-checkpoint", default=str(Path(defaults.checkpoint_dir) / "vqgan_last.pt")
+        "--vqgan-checkpoint", default=default_checkpoint(defaults.checkpoint_dir)
     )
     parser.add_argument("--out", dest="out_dir", default="outputs/vqgan/model_graph")
     parser.add_argument("--port", type=int, default=6007)

@@ -22,6 +22,7 @@ from torchvision.utils import save_image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from vqgan.checkpoints import default_checkpoint
 from vqgan.config import VQGANTrainConfig
 from vqgan.data.sources import IMAGE_EXTENSIONS
 from vqgan.display import console, tqdm
@@ -34,7 +35,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", required=True, help="image file or a directory of them")
     parser.add_argument(
-        "--vqgan-checkpoint", default=str(Path(defaults.checkpoint_dir) / "vqgan_last.pt")
+        "--vqgan-checkpoint", default=default_checkpoint(defaults.checkpoint_dir)
     )
     parser.add_argument(
         "--overlap", type=int, default=64,

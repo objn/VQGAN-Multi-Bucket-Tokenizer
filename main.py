@@ -11,7 +11,6 @@ is focused on getting ViT-VQGAN encode/decode reconstruction quality right first
 """
 
 import json
-import re
 import shutil
 import subprocess
 import sys
@@ -33,33 +32,15 @@ from scripts import (
     train_vqgan,
     visualize_model,
 )
+from vqgan.checkpoints import default_checkpoint, latest_step_checkpoint
 from vqgan.config import DataConfig, VQGANTrainConfig
 from vqgan.refine_config import RefineConfig
 from vqgan.display import console
-
-_STEP_CKPT_RE = re.compile(r"vqgan_step(\d+)\.pt")
 
 
 def ask(prompt: str, default) -> str:
     raw = input(f"{prompt} [{default}]: ").strip()
     return raw if raw else str(default)
-
-
-def latest_step_checkpoint(checkpoint_dir) -> str:
-    """Newest vqgan_stepNNNNNNN.pt in checkpoint_dir by step number — never
-    vqgan_last.pt, which gets overwritten every run and isn't tied to a
-    specific step. Returns "" if none exist."""
-    checkpoint_dir = Path(checkpoint_dir)
-    if not checkpoint_dir.is_dir():
-        return ""
-    candidates = []
-    for p in checkpoint_dir.iterdir():
-        m = _STEP_CKPT_RE.fullmatch(p.name)
-        if m:
-            candidates.append((int(m.group(1)), p))
-    if not candidates:
-        return ""
-    return str(max(candidates, key=lambda t: t[0])[1])
 
 
 def run_build_index():
@@ -225,15 +206,23 @@ def run_finetune_vqgan():
 
 
 def run_train_refine():
-    """Attach a RefinementHead to a chosen backbone, or carry on training one.
+    """Train the refinement head on the model, adding one if it has none yet.
 
-    Its own menu entry rather than more questions inside Train/Finetune: the
-    entry point (attach to a backbone vs. continue a run) and the freeze mode
-    are decisions plain VQ training never has to make, and everyone training
-    without a head would have to answer them anyway.
+    There is no "attach or continue?" question here, because there is no fork
+    to choose between: the model carries on from wherever it is, and whether
+    that step is also the step its head first appears is read off the file
+    rather than asked. A checkpoint without a head gets one, zero-initialized
+    so the model reconstructs exactly as it did a moment before; a checkpoint
+    with one keeps training it. Either way the image count, the lr schedule
+    and the step number continue — one model, one lineage.
 
-    The head's shape (--refine-hidden-channels, --refine-num-blocks) and its
-    finer schedule knobs (--refine-lr, --refine-warmup-steps) are left at
+    Its own menu entry rather than more questions inside Train/Finetune only
+    because of the freeze mode, which plain VQ training never has to choose.
+
+    The head's shape (--refine-hidden-channels, --refine-num-blocks), its loss
+    weights (--refine-disc-weight above all) and the rest of its schedule
+    (--refine-lr-scaling, --refine-min-lr, --refine-end-steps-lr,
+    --refine-lr-warmup-steps, --refine-unfreeze-steps) are left at
     RefineConfig's defaults here. As the module docstring says, call
     scripts/train_vqgan.py directly for full control over every flag.
     """
@@ -241,24 +230,14 @@ def run_train_refine():
     console.print("[dim]source: images-parquet — same corpus as 'Train' (call "
                   "scripts/train_vqgan.py with --source folder to refine on images/)[/dim]")
 
-    # Which of the two starting points this is. They load different amounts of
-    # the same file, and train_vqgan.py refuses both flags at once, so the
-    # menu asks once and passes exactly one.
-    entry = ask("Attach refine to a VQGAN checkpoint (a), or resume an existing refine run (r)?",
-                "a")
-    resume_flag, vqgan_ckpt_flag = [], []
-    if entry.strip().lower().startswith("r"):
-        resume_default = (latest_step_checkpoint(defaults.checkpoint_dir)
-                          or str(Path(defaults.checkpoint_dir) / "vqgan_last.pt"))
-        resume = ask("Resume from checkpoint", resume_default)
-        resume_flag = ["--resume", resume]
-        console.print("[dim]pick the same train stage this checkpoint was saved under — the "
-                      "generator's optimizer state is grouped by it[/dim]")
-    else:
-        default_checkpoint = str(Path(defaults.checkpoint_dir) / "vqgan_last.pt")
-        vqgan_checkpoint = ask("VQGAN backbone checkpoint to attach the head to",
-                               default_checkpoint)
-        vqgan_ckpt_flag = ["--vqgan-checkpoint", vqgan_checkpoint]
+    resume_default = latest_step_checkpoint(defaults.checkpoint_dir)
+    if not resume_default:
+        raise RuntimeError(
+            "training a refinement head needs a model to put it on, and no vqgan_step*.pt "
+            f"was found in {defaults.checkpoint_dir} — train one with 'Train' first"
+        )
+    resume = ask("Checkpoint to train (a head is added if it has none)", resume_default)
+    resume_flag = ["--resume", resume]
 
     stage = ask("Train stage — joint (everything) / refine_only / vq_only", "refine_only")
     if stage not in RefineConfig.STAGES:
@@ -267,11 +246,40 @@ def run_train_refine():
         # raises SystemExit and would take the whole menu down with it.
         raise ValueError(f"train stage must be one of {', '.join(RefineConfig.STAGES)}, "
                          f"got {stage!r}")
-    max_steps = ask("Max steps", defaults.max_steps)
+
+    # How long to train, asked against the clock of the half being trained.
+    # refine_only never moves the backbone, so its length is the head's own
+    # budget and "200000" means 200,000 images of refinement. The VQ budget is
+    # an absolute position on a clock the checkpoint arrives part-way through,
+    # so asking for it here would mean answering with the backbone's history
+    # plus the length you wanted — and answering with the length alone would
+    # end the run before its first step.
+    refine_defaults = RefineConfig()
+    length_flag = []
+    if stage == "refine_only":
+        head_steps = ask("Images to train the head for", refine_defaults.max_steps)
+        length_flag = ["--refine-max-steps", head_steps]
+        # str() because argv is a list of command-line words: ask() returns
+        # strings, this default does not, and argparse indexes each entry to
+        # look for a leading "-".
+        max_steps = str(defaults.max_steps)
+    else:
+        # joint and vq_only both move the backbone, so the run is bounded the
+        # way plain training is. The head's budget rides along at its default
+        # and can still end a joint run first.
+        max_steps = ask("Max steps (total images, this model is already part-way)",
+                        defaults.max_steps)
     batch_size = ask("Batch size", defaults.batch_size)
-    # Lower than Train's default for the same reason Finetune's is: this
-    # starts from a backbone that is already converged, not from noise.
-    lr = ask(f"Learning rate (at batch {defaults.reference_batch_size}, scaled from there)", 1e-5)
+    # Two rates, because there are two schedules: the head's is its own and
+    # reads nothing from the VQ side (see vqgan/refine_config.py). Asking only
+    # one would leave whichever half it did not cover on a default the answer
+    # never mentioned. The backbone's is lower than Train's for the same reason
+    # Finetune's is — it is already converged, not starting from noise — while
+    # the head is new and learns at its own, higher rate.
+    lr = ask(f"Backbone learning rate (at batch {defaults.reference_batch_size}, "
+             f"scaled from there)", 1e-5)
+    refine_lr = ask(f"Refine head learning rate (at batch "
+                    f"{defaults.reference_batch_size}, scaled from there)", RefineConfig().lr)
 
     use_prep = ask("Use a prep data file for the eval subset? (y/n)", "n")
     prep_flag = []
@@ -283,7 +291,8 @@ def run_train_refine():
         "--source", "parquet",
         "--max-steps", max_steps, "--batch-size", batch_size, "--lr", lr,
         "--refine-enabled", "true", "--refine-train-stage", stage,
-        *resume_flag, *vqgan_ckpt_flag, *prep_flag,
+        "--refine-lr", refine_lr,
+        *length_flag, *resume_flag, *prep_flag,
     ]
     train_vqgan.main(argv)
 
@@ -316,13 +325,13 @@ def run_pack_result():
         shutil.move(str(latest_ckpt), str(result_dir / latest_ckpt.name))
         console.print(f"[green]moved[/green] {latest_ckpt.name} to {result_dir}")
     else:
-        console.print("[yellow]no vqgan_step*.pt checkpoint found (vqgan_last.pt is left alone)[/yellow]")
+        console.print("[yellow]no vqgan_step*.pt checkpoint found[/yellow]")
 
 
 def run_evaluate():
     defaults = VQGANTrainConfig()
-    default_checkpoint = str(Path(defaults.checkpoint_dir) / "vqgan_last.pt")
-    vqgan_checkpoint = ask("VQGAN checkpoint", default_checkpoint)
+    checkpoint = default_checkpoint(defaults.checkpoint_dir)
+    vqgan_checkpoint = ask("VQGAN checkpoint", checkpoint)
     source = ask("Source (parquet/folder/all)", defaults.source)
     split = ask("Split (validation/test)", "validation")
     console.print("[dim]the whole split is scored — this can take hours on ImageNet[/dim]")
@@ -337,8 +346,8 @@ def run_test():
     whole images, tiled and reassembled. Source and split are fixed — a test
     set that can be pointed somewhere else is not a test set."""
     defaults = VQGANTrainConfig()
-    default_checkpoint = str(Path(defaults.checkpoint_dir) / "vqgan_last.pt")
-    vqgan_checkpoint = ask("VQGAN checkpoint", default_checkpoint)
+    checkpoint = default_checkpoint(defaults.checkpoint_dir)
+    vqgan_checkpoint = ask("VQGAN checkpoint", checkpoint)
     console.print("[dim]source: images-parquet, test split — images are tiled, run in "
                   "batches, stitched back, then scored at full size[/dim]")
     max_images = ask("Images to score (0 = the whole split)", 2048)
@@ -354,8 +363,8 @@ def run_test():
 def run_reconstruct():
     defaults = VQGANTrainConfig()
     image = ask("Image file or directory", DataConfig().folder_root)
-    default_checkpoint = str(Path(defaults.checkpoint_dir) / "vqgan_last.pt")
-    vqgan_checkpoint = ask("VQGAN checkpoint", default_checkpoint)
+    checkpoint = default_checkpoint(defaults.checkpoint_dir)
+    vqgan_checkpoint = ask("VQGAN checkpoint", checkpoint)
     overlap = ask("Tile overlap (px)", 64)
     reconstruct.main([
         "--image", image,
@@ -367,8 +376,8 @@ def run_reconstruct():
 
 def run_visualize_model():
     defaults = VQGANTrainConfig()
-    default_checkpoint = str(Path(defaults.checkpoint_dir) / "vqgan_last.pt")
-    vqgan_checkpoint = ask("VQGAN checkpoint", default_checkpoint)
+    checkpoint = default_checkpoint(defaults.checkpoint_dir)
+    vqgan_checkpoint = ask("VQGAN checkpoint", checkpoint)
     visualize_model.main(["--vqgan-checkpoint", vqgan_checkpoint])
 
 
@@ -384,7 +393,7 @@ def main_menu():
         "8": ("Test whole images (tile + stitch + score)", run_test),
         "9": ("Reconstruct image (tile + stitch)", run_reconstruct),
         "10": ("Visualize model (TensorBoard graph)", run_visualize_model),
-        "11": ("Train Refinement Head (attach / continue, joint / refine_only / vq_only)",
+        "11": ("Train Refinement Head (added if absent; joint / refine_only / vq_only)",
                run_train_refine),
         "0": ("Exit", None),
     }
