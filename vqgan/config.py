@@ -243,16 +243,16 @@ class VQGANTrainConfig:
     # when it is given its own rate; by default it shares this one.
     lr_warmup_steps: int = 10_000
     eval_every_steps: int = 10_000
-    checkpoint_every_steps: int = 100_000
+    checkpoint_every_steps: int = 20_000
     log_every_steps: int = 10_000
 
     # Learning rate at reference_batch_size; scaled_lr() converts it to the rate
     # this run's batch actually uses. "sqrt" (default) is linear below the
     # reference batch and sqrt at or above it, "linear" and "none" are what they
     # say. See doc/schedule-units.md:63 (batch-size-scaling-of-the-rate-itself)
-    lr: float = 1e-4
+    lr: float = 1e-06
     lr_scaling: str = "sqrt"
-    min_lr: float = 1e-6
+    min_lr: float = 1e-08
     # Images at which lr reaches min_lr — the end of the cosine, which is not
     # required to be the end of the run (see cosine_lr()). A run much shorter
     # than this only walks the first, nearly flat part of the curve: at

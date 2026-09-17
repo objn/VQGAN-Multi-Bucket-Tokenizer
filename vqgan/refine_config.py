@@ -86,7 +86,7 @@ class RefineConfig:
     #
     # Left equal to end_steps_lr on purpose — a head whose rate lands on
     # min_lr exactly as its budget runs out — but nothing keeps them equal.
-    max_steps: int = 200_000
+    max_steps: int = 600_000
     # ---- The head's learning rate, and the schedule it decays on ----
     #
     # A complete schedule, not a set of adjustments to the VQ one: the head
@@ -110,7 +110,7 @@ class RefineConfig:
     # The values here happen to start equal to the VQ defaults, so a run that
     # touches neither trains both halves on the same curve. That is a starting
     # point, not a link — nothing keeps them equal once either side moves.
-    lr: float = 1e-4
+    lr: float = 1e-04
     # How `lr` above is scaled for the batch this run actually uses — the same
     # three rules VQGANTrainConfig.lr_scaling offers ("sqrt" / "linear" /
     # "none"), put through the same scaled_lr(), so a rate quoted here means
@@ -119,7 +119,7 @@ class RefineConfig:
     # choice.
     lr_scaling: str = "sqrt"
     # The floor the head's decay never goes below.
-    min_lr: float = 1e-6
+    min_lr: float = 1e-06
     # The head's own image count at which its decay reaches min_lr — not the
     # run's, so this is simply "how many images the head trains for", and the
     # natural setting is the length of the refine run itself.
@@ -131,7 +131,7 @@ class RefineConfig:
     # training has no minimum to settle into, so the thing that stops it
     # oscillating is the rate getting small — an endpoint far past the end of
     # the run means that never happens.
-    end_steps_lr: float = 200_000
+    end_steps_lr: float = 600_000
     # How long the head's rate ramps linearly from 0 before its cosine starts.
     # 0 = no ramp, straight in at the full rate.
     #
