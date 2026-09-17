@@ -168,8 +168,8 @@ class RefineConfig:
     # nothing in L2 and show up mostly in LPIPS. Raising lpips_weight here is
     # how to say that without touching the VQ side's balance.
     l2_weight: float = 1.0
-    logit_laplace_weight: float = 0.1
-    lpips_weight: float = 1.0
+    logit_laplace_weight: float = 0.01
+    lpips_weight: float = 0.2
     use_lpips: bool = True
     # The adversarial term — the other thing that teaches the decoder to smooth
     # over patch boundaries, and the reason the same value on the VQ side has
@@ -182,13 +182,13 @@ class RefineConfig:
     # which cannot alter structure at all. Asked to look more real, the only
     # move available to it is high-frequency texture, and pushed hard enough
     # that is what it produces — grain, spread evenly, ignoring the picture.
-    disc_weight: float = 1.0
+    disc_weight: float = 1.2
     # ...and its own warmup, on the head's own clock: a freshly created head
     # faces a discriminator that has already trained for millions of images and
     # wants longer before it starts taking its advice. This counts the head's
     # first images, so the number is the head's grace period rather than a
     # threshold the backbone wandered past long ago.
-    disc_warmup_steps: int = 20_000
+    disc_warmup_steps: int = 10_000
     # Gradient clipping for the step as a whole (see
     # VQGANTrainConfig.grad_clip_norm for the reasoning).
     grad_clip_norm: float = 1.0

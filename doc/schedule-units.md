@@ -64,25 +64,79 @@ Which clock each curve is read against is in [clocks.md](clocks.md).
 
 Separate from the schedule, and often confused with it.
 `VQGANTrainConfig.scaled_lr()` converts the rate you *quote* into the rate the
-run *uses*, given its batch:
+run *uses*, given its batch. A rate quoted anywhere therefore means the rate at
+`reference_batch_size`, and the same number stays comparable across runs at
+different batches. At `reference_batch_size` there is no scaling at all.
+
+This is why the menu prompt reads `at batch 8, scaled from there` even when you
+just answered 4 for batch size: the 8 is `reference_batch_size`.
+
+Three rules, with `ratio = batch_size * world_size / reference_batch_size`:
+
+| `lr_scaling` | multiplier |
+| --- | --- |
+| `"sqrt"` (default) | `ratio` below the reference batch, `sqrt(ratio)` at or above it |
+| `"linear"` | `ratio` |
+| `"none"` | 1 |
+
+## Why "sqrt" is piecewise
+
+What matters is not the size of a step but how far the weights travel per
+image of data. Every loss in this project uses **mean** reduction, so the
+gradient's expected magnitude does not depend on the batch — and Adam
+normalizes by a running gradient magnitude on top of that, so a step moves
+roughly `lr` whatever the batch is. What the batch changes is how many steps
+a given number of images buys:
 
 ```
-lr_used = lr_quoted * sqrt(batch_size * world_size / reference_batch_size)
+travel per image  ∝  lr / batch
 ```
 
-with `"sqrt"`, `"linear"` and `"none"` as the three rules. So a rate quoted
-anywhere means the rate at `reference_batch_size`, and the same number stays
-comparable across runs at different batches. At `reference_batch_size` there
-is no scaling at all.
+Halve the batch and you take twice as many steps of the same size over the
+same data. That is what the scaling exists to correct, and it is the reason
+mean reduction makes the correction *necessary* rather than redundant.
 
-This is why the menu prompt reads `at batch 8, scaled from there` even when
-you just answered 4 for batch size: the 8 is `reference_batch_size`, and
-`1e-5` typed at batch 4 becomes `7.07e-6`.
+A plain `sqrt(ratio)` only corrects half of it, in log terms. Above the
+reference batch that errs safe — the rule is increasingly conservative, which
+is the intended trade against a `linear` rule that pushes large batches into
+the range where a ViT plus an adversarial term goes unstable (`linear` at
+batch 128 asks for 1.6e-3). Below the reference batch the same shortfall errs
+the *other* way, and training at batch 4 or less was visibly unstable:
 
-Under DDP the noise this corrects for is set by the **global** batch, since
-DDP averages gradients across ranks — so `world_size` is passed in and an
-N-GPU run at a given global batch picks the same rate a 1-GPU run at that
-batch would.
+| batch | `sqrt(ratio)` | travel/image | piecewise | travel/image |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.354 | **2.83x** | 0.125 | 1.00x |
+| 2 | 0.500 | **2.00x** | 0.250 | 1.00x |
+| 4 | 0.707 | **1.41x** | 0.500 | 1.00x |
+| 8 | 1.000 | 1.00x | 1.000 | 1.00x |
+| 16 | 1.414 | 0.71x | 1.414 | 0.71x |
+| 32 | 2.000 | 0.50x | 2.000 | 0.50x |
+| 128 | 4.000 | 0.25x | 4.000 | 0.25x |
+
+So each rule is used where it is right: `linear` holds travel per image
+constant and is the SGD result (Goyal et al.), sound while a batch is small
+enough that step count rather than gradient noise is the limit; `sqrt` takes
+over once it is not. **At or above the reference batch the multiplier is
+unchanged**, so nothing about a run at batch 8 or more differs from before
+this rule existed.
+
+`betas=(0.5, 0.9)` sharpens all of this — those are windows of about 2 and 10
+steps, so Adam smooths very little here and per-step noise passes almost
+straight through. See [optimizer-state.md](optimizer-state.md).
+
+One thing the rule does not cover: crops are tiles of a photo, so a small
+batch may hold several tiles of the same image and be worth fewer independent
+samples than its size suggests. `shuffle_buffer` is set to at least
+`8 * batch_size` to fight exactly that. `grad_clip_norm` is not covered
+either — a noisier small-batch gradient hits the ceiling more often, which
+shortens steps in a way no learning-rate rule accounts for.
+
+## The rest of the arithmetic
+
+Under DDP the batch a rate is scaled for is the **global** one, since DDP
+averages gradients across ranks — so `world_size` is passed in, and an N-GPU
+run at a given global batch picks the same rate a 1-GPU run at that batch
+would. 4 GPUs at batch 2 and 1 GPU at batch 8 both resolve to the quoted rate.
 
 The head has its own rule (`RefineConfig.lr_scaling`) put through the same
 arithmetic. Sharing the arithmetic is not sharing the choice.

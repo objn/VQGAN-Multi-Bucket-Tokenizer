@@ -246,22 +246,10 @@ class VQGANTrainConfig:
     checkpoint_every_steps: int = 100_000
     log_every_steps: int = 10_000
 
-    # Learning rate at reference_batch_size. The rate actually used is this
-    # scaled by lr_scaling, because a larger batch averages away gradient noise
-    # and a rate tuned against the noisier gradient then understeps:
-    #
-    #   "sqrt"   lr * sqrt(batch / reference)   batch 128 -> 4.0e-4
-    #   "linear" lr * (batch / reference)       batch 128 -> 1.6e-3
-    #   "none"   lr, whatever the batch is
-    #
-    # sqrt by default. The linear rule is the SGD result (Goyal et al.); Adam
-    # already divides by a running gradient magnitude, so only the *noise* term
-    # is left to correct for, which grows as sqrt(batch) — and 1.6e-3 is well
-    # into the range where a ViT plus an adversarial term goes unstable.
-    #
-    # RefineConfig.lr/lr_scaling are the refinement head's own pair, put
-    # through this same scaled_lr() so a rate quoted there means the same
-    # thing — the rate at reference_batch_size — as one quoted here.
+    # Learning rate at reference_batch_size; scaled_lr() converts it to the rate
+    # this run's batch actually uses. "sqrt" (default) is linear below the
+    # reference batch and sqrt at or above it, "linear" and "none" are what they
+    # say. See doc/schedule-units.md:63 (batch-size-scaling-of-the-rate-itself)
     lr: float = 1e-4
     lr_scaling: str = "sqrt"
     min_lr: float = 1e-6
@@ -337,7 +325,9 @@ class VQGANTrainConfig:
         if scaling == "linear":
             return lr * ratio
         if scaling == "sqrt":
-            return lr * math.sqrt(ratio)
+            # Linear below the reference batch, sqrt at or above it. See
+            # doc/schedule-units.md:63 (batch-size-scaling-of-the-rate-itself)
+            return lr * (ratio if ratio < 1 else math.sqrt(ratio))
         raise ValueError(f"lr_scaling must be sqrt, linear or none, got {scaling!r}")
 
     def model_config(self) -> dict:
